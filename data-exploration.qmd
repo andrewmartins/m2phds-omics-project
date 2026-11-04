@@ -1,0 +1,35 @@
+---
+title: "prelim-analysis"
+format: html
+editor: visual
+---
+
+```{r}
+
+library(dplyr)
+
+participants = read.csv(here::here("data","participants.csv"))
+participants
+
+flow_outcome = read.csv(here::here("data","publicData_ex_vivo_flow.csv"))
+rnaSeq_2024 = read.csv(here::here("data","publicData_rnaseq_2024_UGA.csv"))
+
+flow_outcome
+
+flow_outcome = flow_outcome%>%
+  filter(
+    name == "Antibody-secreting_cells_(ASC)",
+    timepoint == 7
+  )
+
+flow_outcome
+
+common_ids <- intersect(
+  flow_outcome$participant_id,
+  rnaSeq_2024$participant_id
+)
+length(common_ids)
+```
+
+```{r}
+```
