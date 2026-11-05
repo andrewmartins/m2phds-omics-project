@@ -5,17 +5,24 @@ editor: visual
 ---
 
 ```{r}
-
 library(dplyr)
+library(ggplot2)
+library(tidydr)
 
+# loading data
 participants = read.csv(here::here("data","participants.csv"))
 participants
+
+vaccine_hist = read.csv(here::here("data", "participant_vaccineHistory.csv"))
 
 flow_outcome = read.csv(here::here("data","publicData_ex_vivo_flow.csv"))
 rnaSeq_2024 = read.csv(here::here("data","publicData_rnaseq_2024_UGA.csv"))
 
+saveRDS(rnaSeq_2024, here::here("data", "rnaseq.rds"))
+
 flow_outcome
 
+# filtering on patients who have a 7 day plasmablast signal
 flow_outcome = flow_outcome%>%
   filter(
     name == "Antibody-secreting_cells_(ASC)",
@@ -24,6 +31,7 @@ flow_outcome = flow_outcome%>%
 
 flow_outcome
 
+# identifying the same patients with an exposure signal in RNAseq
 common_ids <- intersect(
   flow_outcome$participant_id,
   rnaSeq_2024$participant_id
@@ -32,4 +40,116 @@ length(common_ids)
 ```
 
 ```{r}
+
+# visualizing some data
+
+cohort = participants[participants$participant_id %in% common_ids,]
+
+cohort = cohort %>%
+  inner_join(flow_outcome, by = "participant_id") %>%
+  select(-subject.x) %>%
+  rename(subject = subject.y)
+
+vaccine_hist_agg = vaccine_hist %>%
+  group_by(subject) %>%
+  summarise(
+    n_prior_vax = sum(received %in% c("Yes_selfReported","Yes_Study"))
+  )
+
+
+cohort = left_join(cohort, vaccine_hist_agg, by = "subject")
+cohort = cohort %>%
+  mutate(n_prior_vax = coalesce(n_prior_vax,0))
+
+cohort
+cohort$log_freq = log(cohort$value)
+
+plasmablast_propo_hist = ggplot(cohort, aes(x = log_freq)) +
+  geom_histogram(bins = 29, fill = "#4C72B0", colour = "white", alpha = 0.9) + 
+  labs(
+    title = "Distribution of plasmablast frequency at day 7",
+    subtitle = paste0("n = ", nrow(cohort), " participants"),
+    x = "Plasmablast frequency (%)",
+    y = "Number of participants"
+  ) + 
+  theme_minimal(base_size = 14) + 
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "grey40"),
+    panel.grid.major = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+plasmablast_propo_hist
+```
+
+```{r}
+
+# age hist
+age_box <- ggplot(cohort, aes(x = "", y = age)) +
+  geom_boxplot(fill = "#4C72B0", colour = "grey20", alpha = 0.6,
+               width = 0.4, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.7, colour = "grey20") +
+  labs(
+    title    = "Distribution of age among cohort",
+    subtitle = paste0("n = ", nrow(cohort), " participants"),
+    x        = NULL,
+    y        = "Age (years)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    plot.subtitle      = element_text(colour = "grey40"),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+age_box
+```
+
+```{r}
+# age hist
+# Number of prior vaccinations
+p_prior_vax <- ggplot(cohort, aes(x = n_prior_vax)) +
+  geom_bar(fill = "#4C72B0", colour = "white", alpha = 0.9) +
+  scale_x_continuous(breaks = 0:max(cohort$n_prior_vax, na.rm = TRUE)) +
+  labs(
+    title    = "Number of previous vaccinations",
+    subtitle = paste0("n = ", nrow(cohort), " participants"),
+    x        = "Number of prior seasonal influenza vaccinations",
+    y        = "Number of participants"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    plot.subtitle      = element_text(colour = "grey40"),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p_prior_vax
+
+```
+
+```{r}
+p_sex <- ggplot(cohort, aes(x = biological_sex)) +
+  geom_bar(fill = "#4C72B0", colour = "white", alpha = 0.9, width = 0.6) +
+  geom_text(stat = "count",
+            aes(label = paste0(after_stat(count), " (",
+                               round(100 * after_stat(count) / nrow(cohort)), "%)")),
+            vjust = -0.5, size = 5) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title    = "Sex distribution of the cohort",
+    subtitle = paste0("n = ", nrow(cohort), " participants"),
+    x        = NULL,
+    y        = "Number of participants"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    plot.subtitle      = element_text(colour = "grey40"),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p_sex
 ```
