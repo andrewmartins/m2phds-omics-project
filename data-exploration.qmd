@@ -9,57 +9,14 @@ library(dplyr)
 library(ggplot2)
 library(tidydr)
 
-# loading data
-participants = read.csv(here::here("data","participants.csv"))
-participants
-
-vaccine_hist = read.csv(here::here("data", "participant_vaccineHistory.csv"))
-
-flow_outcome = read.csv(here::here("data","publicData_ex_vivo_flow.csv"))
-rnaSeq_2024 = read.csv(here::here("data","publicData_rnaseq_2024_UGA.csv"))
-
-saveRDS(rnaSeq_2024, here::here("data", "rnaseq.rds"))
-
-flow_outcome
-
-# filtering on patients who have a 7 day plasmablast signal
-flow_outcome = flow_outcome%>%
-  filter(
-    name == "Antibody-secreting_cells_(ASC)",
-    timepoint == 7
-  )
-
-flow_outcome
-
-# identifying the same patients with an exposure signal in RNAseq
-common_ids <- intersect(
-  flow_outcome$participant_id,
-  rnaSeq_2024$participant_id
-)
-length(common_ids)
+cohort = readRDS(here::here("data", "participants_cleaned.rds"))
+rnaseq = readRDS(here::here("data", "rnaseq.rds"))
+vaccine_hist = readRDS(here::here("data", "rnaseq.rds"))
 ```
 
 ```{r}
 
 # visualizing some data
-
-cohort = participants[participants$participant_id %in% common_ids,]
-
-cohort = cohort %>%
-  inner_join(flow_outcome, by = "participant_id") %>%
-  select(-subject.x) %>%
-  rename(subject = subject.y)
-
-vaccine_hist_agg = vaccine_hist %>%
-  group_by(subject) %>%
-  summarise(
-    n_prior_vax = sum(received %in% c("Yes_selfReported","Yes_Study"))
-  )
-
-
-cohort = left_join(cohort, vaccine_hist_agg, by = "subject")
-cohort = cohort %>%
-  mutate(n_prior_vax = coalesce(n_prior_vax,0))
 
 cohort
 cohort$log_freq = log(cohort$value)
