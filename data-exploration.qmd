@@ -8,6 +8,8 @@ editor: visual
 library(dplyr)
 library(ggplot2)
 library(tidydr)
+library(gtsummary)
+library(here)
 
 cohort = readRDS(here::here("data", "participants_cleaned.rds"))
 rnaseq = readRDS(here::here("data", "rnaseq.rds"))
@@ -20,8 +22,9 @@ vaccine_hist = readRDS(here::here("data", "rnaseq.rds"))
 
 cohort
 cohort$log_freq = log(cohort$value)
+# cohort$value = cohort$value*10
 
-plasmablast_propo_hist = ggplot(cohort, aes(x = log_freq)) +
+plasmablast_propo_hist = ggplot(cohort, aes(x = value)) +
   geom_histogram(bins = 29, fill = "#4C72B0", colour = "white", alpha = 0.9) + 
   labs(
     title = "Distribution of plasmablast frequency at day 7",
@@ -36,7 +39,8 @@ plasmablast_propo_hist = ggplot(cohort, aes(x = log_freq)) +
     panel.grid.major = element_blank(),
     panel.grid.major.x = element_blank()
   )
-plasmablast_propo_hist
+
+ggsave(here("output", "plasmablast_propo_hist.png"))
 ```
 
 ```{r}
@@ -59,7 +63,8 @@ age_box <- ggplot(cohort, aes(x = "", y = age)) +
     panel.grid.minor   = element_blank(),
     panel.grid.major.x = element_blank()
   )
-age_box
+
+ggsave(here("output", "age_box.png"))
 ```
 
 ```{r}
@@ -108,5 +113,45 @@ p_sex <- ggplot(cohort, aes(x = biological_sex)) +
     panel.grid.major.x = element_blank()
   )
 
-p_sex
+ggsave(here("output","p_sex.png"))
+```
+
+```{r}
+
+rnaseq %>%
+  group_by(participant_id,ensemnl_gene) %>%
+  summarise(
+    n_unique_genes = n_distinct(ensembl_gene_id),
+    counts = sum(counts)
+  )
+
+rnaseq
+
+table1 = cohort %>%
+  select(age, biological_sex, n_prior_vax, value) %>%
+  tbl_summary()
+
+table1 <- cohort %>%
+  select(age, biological_sex, n_prior_vax, value) %>%
+  tbl_summary(
+    label = list(
+      age         ~ "Age (years)",
+      biological_sex ~ "Sex",
+      n_prior_vax ~ "Number of prior vaccinations",
+      value ~ "Plasmablast frequency at day 7 (%)"
+    ),
+    statistic = list(
+      all_continuous()  ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits  = list(value ~ 2),
+    missing = "ifany",
+    missing_text = "Unknown"
+  ) %>%
+  bold_labels()
+
+table1
+
+
+gt::gtsave(as_gt(table1), here("output", "table1.png"))
 ```
