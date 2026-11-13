@@ -13,7 +13,51 @@ library(here)
 
 cohort = readRDS(here::here("data", "participants_cleaned.rds"))
 rnaseq = readRDS(here::here("data", "rnaseq.rds"))
-vaccine_hist = readRDS(here::here("data", "rnaseq.rds"))
+vaccine_hist = readRDS(here::here("data", "vaccine_hist.rds"))
+
+result = left_join(cohort, rnaseq, by = "participant_id") %>%
+  group_by(participant_id, biological_sex, n_prior_vax) %>%
+  summarise(
+    n_unique_genes = n_distinct(ensembl_gene_id),
+    counts = sum(counts)
+  )
+
+cohort
+rnaseq %>%
+  group_by(material) %>%
+  summarise(
+    counts = n()
+  )
+result
+
+
+ct <- cor.test(result$n_prior_vax, result$counts, method = "spearman", exact = FALSE)
+
+p_lib_vax <- ggplot(result, aes(x = factor(n_prior_vax), y = counts / 1e6)) +
+  stat_summary(fun = mean, geom = "col", fill = "#4C72B0", alpha = 0.8, width = 0.7) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.25, colour = "grey30") +
+  geom_jitter(width = 0.12, height = 0, size = 2, alpha = 0.7, colour = "grey20") +
+  labs(
+    title    = "Total RNA-seq transcript counts by vaccination history",
+    subtitle = sprintf("Mean ± SE, points show participants (n = %d); Spearman's rho = %.2f, p = %.2f",
+                       nrow(result), ct$estimate, ct$p.value),
+    x        = "Number of prior seasonal influenza vaccinations",
+    y        = "Total transcript counts (millions)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title         = element_text(face = "bold"),
+    plot.subtitle      = element_text(colour = "grey40"),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+p_lib_vax
+
+
+rnaseq
+
+vaccine_hist
 ```
 
 ```{r}
@@ -118,8 +162,9 @@ ggsave(here("output","p_sex.png"))
 
 ```{r}
 
+rnaseq
 rnaseq %>%
-  group_by(participant_id,ensemnl_gene) %>%
+  group_by(participant_id,ensembl_gene_id) %>%
   summarise(
     n_unique_genes = n_distinct(ensembl_gene_id),
     counts = sum(counts)
@@ -134,22 +179,23 @@ table1 = cohort %>%
 table1 <- cohort %>%
   select(age, biological_sex, n_prior_vax, value) %>%
   tbl_summary(
+    type = list(n_prior_vax ~ "continuous"),
     label = list(
-      age         ~ "Age (years)",
+      age            ~ "Age (years)",
       biological_sex ~ "Sex",
-      n_prior_vax ~ "Number of prior vaccinations",
-      value ~ "Plasmablast frequency at day 7 (%)"
+      n_prior_vax    ~ "Number of prior vaccinations",
+      value          ~ "Plasmablast frequency at day 7 (%)"
     ),
     statistic = list(
       all_continuous()  ~ "{median} ({p25}, {p75})",
       all_categorical() ~ "{n} ({p}%)"
     ),
-    digits  = list(value ~ 2),
+    digits  = list(value ~ 4),
     missing = "ifany",
     missing_text = "Unknown"
-  ) %>%
-  bold_labels()
-
+  )  %>%
+  bold_labels() %>%
+  modify_caption("**Table 1. Characteristics of the study cohort**")
 table1
 
 
