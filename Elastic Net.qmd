@@ -1,0 +1,679 @@
+---
+title: "Elastic Net"
+author: "Group 2"
+format: html
+editor: source
+---
+
+### Load packages and data
+
+```{r}
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(here)
+
+
+# Load the merged TPM dataset
+analysis_tpm <- readRDS(here("data", "processed", "analysis_tpm.rds"))
+
+# Check dimensions
+dim(analysis_tpm)
+```
+
+### Separate the outcome and predictors
+
+```{r}
+# Outcome: Day 7 plasmablast frequency
+y_vec <- analysis_tpm$plasmablast_frequency
+
+# Identify gene columns using their Ensembl IDs
+gene_cols <- grep(
+  "^ENSG",
+  names(analysis_tpm),
+  value = TRUE
+)
+
+# Extract gene expression matrix
+X_mat <- as.matrix(analysis_tpm[, gene_cols])
+
+# Transform TPM values
+X_mat <- log2(X_mat + 1)
+
+# Verify dimensions
+dim(X_mat)
+length(y_vec)
+```
+
+We transform the TPM values using log2(TPM+1) because RNA-seq gene expression is typically highly skewed since many genes have low expression and only a small number have high expression.
+
+The transformation compresses large values.
+
+### Check the data
+
+```{r}
+# Confirm predictor and outcome dimensions match
+stopifnot(nrow(X_mat)== length(y_vec))
+
+# Check for missing values
+sum(is.na(X_mat))
+sum(is.na(y_vec))
+
+# Check for infinite values
+sum(!is.finite(X_mat))
+
+# Summarize outcome
+summary(y_vec)
+```
+
+### Explore outcome
+
+```{r}
+# Create histogram of the response
+
+response_hist <- ggplot(
+  analysis_tpm,
+  aes(x = plasmablast_frequency)
+) +
+  geom_histogram(bins = 12) +
+  labs(
+    title = "Distribution of Day 7 Plasmablast Frequency",
+    x = "Day 7 plasmablast frequency",
+    y = "Number of participants"
+  ) +
+  theme_minimal()
+
+response_hist
+```
+
+A bit right-skewed, keeping original scale for now, but we can try a transformation later as a sensitivity analysis.
+
+### Check gene-expression variability
+
+```{r}
+# Calculate the variance of each gene across participants
+gene_variances <- apply(X_mat, 2, var)
+
+# Count genes with zero and nonzero variance
+sum(gene_variances == 0)
+sum(gene_variances > 0)
+
+# Summarize gene variances
+summary(gene_variances)
+```
+
+A substantial proportion of genes have no variation in expression across the 29 participants (25213) meaning these cannot help the elastic net model distinguish between individuals.
+
+-   Total genes = 78,932
+
+-   Zero-variance genes = 25,213 (31.9%)
+
+-   Nonzero-variance genes = 53,719 (68.1%) (Genes whose expression differs between at least two participants)
+
+Variance here is calculated after transforming expression values using log(TPM+1)
+
+For the final predictive analysis we will have to perform gene filtering within the cross-validation training folds to avoid information leakage. Nonzero variance alone also does not mean that a gene is predictive of plasmablast frequency.
+
+don't remove the 25,213 genes from the entire dataset yet. Instead, we filter genes separately within each training fold, so the held-out participants don't influence preprocessing
+
+### Elastic net regression with nested cross-validation
+
+```{r}
+
+set.seed(123)
+# Create five outer folds for model evaluation
+folds <- createFolds(
+  y_vec,
+  k = 5,
+  list = TRUE
+)
+
+# Check number of participants in each test fold
+sapply(folds, length)
+```
+
+**Outer cross-validation:** Divides the 29 participants into five groups. Each group serves as the test set once, while the remaining participants are used for training.
+
+**Inner cross-validation:** In each outer training set, we use another five-fold cross-validation procedure to select the optimal α and λ
+
+#### Check gene filtering in one fold
+
+```{r}
+# Use the first outer fold as an example
+test_idx <- folds[[1]]
+
+# Split gene expression into training and testing sets
+X_train <- X_mat[-test_idx, , drop = FALSE]
+X_test  <- X_mat[test_idx, , drop = FALSE]
+
+# Split the outcome
+y_train <- y_vec[-test_idx]
+y_test  <- y_vec[test_idx]
+
+# Identify genes with nonzero variance in training data
+keep_genes <- apply(X_train, 2, var) > 0
+
+# Apply the SAME gene selection to both datasets
+X_train <- X_train[, keep_genes, drop = FALSE]
+X_test  <- X_test[, keep_genes, drop = FALSE]
+
+# Check dimensions
+dim(X_train)
+dim(X_test)
+
+# Number of genes retained
+sum(keep_genes)
+```
+
+To evaluate elastic net predictive performance, five-fold outer cross-validation was used to separate training and testing participants. Within each training fold, genes with zero variance were removed, and the same gene subset was retained in the corresponding test set. This ensures that feature filtering is determined exclusively from training data. Elastic net hyperparameters α and λ will subsequently be tuned using five-fold inner cross-validation, with predictive performance evaluated on held-out participants.
+
+### Fit elastic net using nested cross-validation
+
+```{r}
+
+# =========================================================
+# Nested cross-validation: elastic net
+# =========================================================
+
+# Use the tuning grid and outer folds created previously.
+# Replace the earlier lambda grid with values more appropriate
+# for the small numerical scale of plasmablast frequency.
+
+elastic_net_grid <- expand.grid(
+  alpha = c(0, 0.25, 0.5, 0.75, 1),
+  lambda = c(
+    0.000001,
+    0.00001,
+    0.0001,
+    0.001,
+    0.01,
+    0.05,
+    0.1
+  )
+)
+
+# Create vectors for storing results
+elastic_net_predictions <- rep(NA_real_, length(y_vec))
+baseline_predictions <- rep(NA_real_, length(y_vec))
+
+best_alphas <- rep(NA_real_, length(folds))
+best_lambdas <- rep(NA_real_, length(folds))
+genes_retained <- rep(NA_integer_, length(folds))
+
+# Calculate RMSE only during inner cross-validation
+rmse_only <- function(data, lev = NULL, model = NULL) {
+  c(RMSE = sqrt(mean((data$obs - data$pred)^2)))
+}
+
+# Repeat across all five outer folds
+for (i in seq_along(folds)) {
+
+  cat("Running outer fold", i, "\n")
+
+  # Select held-out participants
+  test_idx <- folds[[i]]
+
+  # Divide data into training and testing sets
+  X_train <- X_mat[-test_idx, , drop = FALSE]
+  X_test  <- X_mat[test_idx, , drop = FALSE]
+  y_train <- y_vec[-test_idx]
+
+  # Identify genes with nonzero variance in training data
+  keep_genes <- apply(X_train, 2, var) > 0
+
+  # Keep the same gene columns in training and testing sets
+  X_train <- X_train[, keep_genes, drop = FALSE]
+  X_test <- X_test[, keep_genes, drop = FALSE]
+
+  genes_retained[i] <- sum(keep_genes)
+
+  # Inner cross-validation selects alpha and lambda
+  elastic_net_model <- caret::train(
+    x = X_train,
+    y = y_train,
+    method = "glmnet",
+    tuneGrid = elastic_net_grid,
+    trControl = trainControl(
+      method = "cv",
+      number = 5,
+      summaryFunction = rmse_only
+    ),
+    metric = "RMSE",
+    preProcess = c("zv", "center", "scale"),
+    standardize = FALSE
+  )
+
+  # Predict participants in the held-out outer fold
+  elastic_net_predictions[test_idx] <- as.numeric(
+    predict(elastic_net_model, newdata = X_test)
+  )
+
+  # Simple reference model: training-set mean outcome
+  baseline_predictions[test_idx] <- mean(y_train)
+
+  # Store selected tuning parameters
+  best_alphas[i] <- elastic_net_model$bestTune$alpha
+  best_lambdas[i] <- elastic_net_model$bestTune$lambda
+}
+
+# Confirm all participants have a prediction
+stopifnot(
+  !anyNA(elastic_net_predictions),
+  !anyNA(baseline_predictions)
+)
+
+```
+
+#### Evaluate elastic net
+
+```{r}
+
+# RMSE: average magnitude of prediction errors
+rmse_elastic_net <- sqrt(
+  mean((y_vec - elastic_net_predictions)^2)
+)
+
+# Pooled cross-validated R-squared
+r2_elastic_net <- 1 -
+  sum((y_vec - elastic_net_predictions)^2) /
+  sum((y_vec - mean(y_vec))^2)
+
+# Compare with a simple baseline model
+rmse_baseline <- sqrt(
+  mean((y_vec - baseline_predictions)^2)
+)
+
+r2_baseline <- 1 -
+  sum((y_vec - baseline_predictions)^2) /
+  sum((y_vec - mean(y_vec))^2)
+
+# Display results
+data.frame(
+  model = c("Elastic net", "Training-mean baseline"),
+  RMSE = c(rmse_elastic_net, rmse_baseline),
+  R2 = c(r2_elastic_net, r2_baseline)
+)
+
+# Inspect selected hyperparameters and retained genes
+data.frame(
+  fold = seq_along(folds),
+  alpha = best_alphas,
+  lambda = best_lambdas,
+  genes_retained = genes_retained
+)
+
+
+
+```
+
+RMSE = lower is better
+
+baseline model is extremely simple. it doesn't use gene expression at all and just predicts the average plasmablast frequency of the training participants (just a simple average)
+
+R^2^ = 1 is perfect prediction, R^2^ = 0 means predictions are as good as the overall sample mean, and R\^2 below 0 means predictions are worse than that overall-mean benchmark
+
+-   **Small lambda:** The model is allowed to rely more strongly on gene expression patterns.
+
+-   **Large lambda:** The model shrinks the gene coefficients more heavily, making its predictions less dependent on those patterns.
+
+### plot observed versus predicted values
+
+```{r}
+
+library(ggplot2)
+
+prediction_results <- data.frame(
+  participant_id = analysis_tpm$participant_id,
+  observed = y_vec,
+  predicted = elastic_net_predictions
+)
+
+elastic_net_plot <- ggplot(
+  prediction_results,
+  aes(x = observed, y = predicted)
+) +
+  geom_point(size = 2.5) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  coord_equal() +
+  labs(
+    title = "Elastic Net: Observed vs Predicted",
+    subtitle = "Five-fold nested cross-validation",
+    x = "Observed Day 7 plasmablast frequency",
+    y = "Predicted Day 7 plasmablast frequency"
+  ) +
+  theme_minimal()
+
+elastic_net_plot
+
+# Save figure
+dir.create("output", showWarnings = FALSE)
+
+ggsave(
+  "output/elastic_net_predictions.pdf",
+  elastic_net_plot,
+  width = 7,
+  height = 5
+)
+
+```
+
+Elastic net regression was used to evaluate whether baseline gene expression could predict Day 7 plasmablast frequency. Five-fold nested cross-validation was implemented, with an inner loop for tuning the mixing parameter (α) and regularization strength (λ), and an outer loop for evaluating predictive performance in held-out participants. Genes with zero variance were removed using training data, and predictors were standardized within cross-validation. Predictive performance was evaluated using RMSE and cross-validated R² and compared with a training-mean baseline model.
+
+### Additional analyses
+
+#### Investigate prediction errors
+
+plot shows that the model substantially underpredicts some participants with high plasmablast frequencies
+
+identify those observations:
+
+```{r}
+# Calculate prediction errors for each participant
+prediction_results <- prediction_results %>%
+  mutate(
+    error = predicted - observed,
+    absolute_error = abs(error),
+    squared_error = error^2
+  )
+
+# Participants with the largest prediction errors
+prediction_results %>%
+  arrange(desc(absolute_error)) %>%
+  head(10)
+
+```
+
+check how much the largest errors contribute to overall performance:
+
+```{r}
+# Contribution of the three largest errors to total SSE
+prediction_results %>%
+  arrange(desc(squared_error)) %>%
+  summarise(
+    top_3_error_fraction =
+      sum(head(squared_error, 3)) / sum(squared_error)
+  )
+
+```
+
+**Just three of the 29 participants account for approximately 72% of the model's total squared prediction error.**
+
+Prediction errors were examined to identify observations contributing disproportionately to overall model error. The three largest squared prediction errors accounted for 71.9% of the total sum of squared errors.
+
+These observations corresponded to participants with relatively high Day 7 plasmablast frequencies (0.0341, 0.0280, and 0.0173), which were substantially underpredicted by the model. This suggests that the elastic net model had difficulty capturing higher plasmablast responses and tended to generate predictions closer to the population mean.
+
+Given the small sample size, these observations substantially influenced model performance. However, they were retained in the analysis because high responses alone do not justify exclusion
+
+### Compare with a demographic model
+
+```{r}
+# Prepare demographic data, including the outcome
+clinical_data <- analysis_tpm %>%
+  select(
+    plasmablast_frequency,
+    age,
+    biological_sex
+  ) %>%
+  mutate(
+    biological_sex = as.factor(biological_sex)
+  )
+
+# Check for missing values
+colSums(is.na(clinical_data))
+
+# Store held-out predictions
+clinical_predictions <- rep(NA_real_, length(y_vec))
+
+# Use the SAME outer folds as elastic net
+for (i in seq_along(folds)) {
+
+  test_idx <- folds[[i]]
+
+  # Separate training and testing participants
+  clinical_train <- clinical_data[-test_idx, , drop = FALSE]
+  clinical_test <- clinical_data[test_idx, , drop = FALSE]
+
+  # Fit regression using training participants only
+  clinical_model <- lm(
+    plasmablast_frequency ~ age + biological_sex,
+    data = clinical_train
+  )
+
+  # Predict held-out participants
+  clinical_predictions[test_idx] <- predict(
+    clinical_model,
+    newdata = clinical_test
+  )
+}
+
+# Confirm predictions exist for all participants
+stopifnot(!anyNA(clinical_predictions))
+
+# Evaluate demographic model
+rmse_clinical <- sqrt(
+  mean((y_vec - clinical_predictions)^2)
+)
+
+r2_clinical <- 1 -
+  sum((y_vec - clinical_predictions)^2) /
+  sum((y_vec - mean(y_vec))^2)
+
+# Compare models
+data.frame(
+  Model = c(
+    "Mean-only baseline",
+    "Age + sex",
+    "Elastic net gene expression"
+  ),
+  RMSE = c(
+    rmse_baseline,
+    rmse_clinical,
+    rmse_elastic_net
+  ),
+  R2 = c(
+    r2_baseline,
+    r2_clinical,
+    r2_elastic_net
+  )
+)
+
+```
+
+this will tell us if gene expression predicts the plasmablast response better than basic demographic information
+
+**gene expression predicts Day 7 plasmablast frequency slightly better than age and sex alone**
+
+### 
+
+## Combined elastic net model with baseline gene expression + age + sex
+
+```{r}
+
+# =========================================================
+# Combined elastic net: gene expression + demographics
+# =========================================================
+
+# Create numeric demographic predictors
+# model.matrix() converts biological_sex into a dummy variable
+demographic_mat <- model.matrix(
+  ~ age + biological_sex,
+  data = analysis_tpm
+)[, -1, drop = FALSE]
+
+# Combine gene expression with demographic predictors
+X_combined <- cbind(
+  X_mat,
+  demographic_mat
+)
+
+# Check dimensions
+dim(X_combined)
+
+# Check demographic variable names
+colnames(demographic_mat)
+
+# Confirm rows match the outcome
+stopifnot(
+  nrow(X_combined) == length(y_vec),
+  !anyNA(X_combined),
+  all(is.finite(X_combined))
+)
+
+```
+
+### Fit the combined elastic net
+
+```{r}
+
+# Store predictions for each participant
+combined_predictions <- rep(NA_real_, length(y_vec))
+
+# Store the best tuning parameters
+combined_alphas <- rep(NA_real_, length(folds))
+combined_lambdas <- rep(NA_real_, length(folds))
+combined_genes_retained <- rep(NA_integer_, length(folds))
+
+# Reuse the SAME outer folds and tuning grid
+for (i in seq_along(folds)) {
+
+  cat("Running combined model - outer fold", i, "\n")
+
+  # 1. Select held-out participants
+  test_idx <- folds[[i]]
+
+  # 2. Split training and testing data
+  X_train <- X_combined[-test_idx, , drop = FALSE]
+  X_test  <- X_combined[test_idx, , drop = FALSE]
+
+  y_train <- y_vec[-test_idx]
+
+  # 3. Remove zero-variance predictors using training data
+  keep_predictors <- apply(X_train, 2, var) > 0
+
+  X_train <- X_train[, keep_predictors, drop = FALSE]
+  X_test  <- X_test[, keep_predictors, drop = FALSE]
+
+  combined_genes_retained[i] <- sum(
+    keep_predictors[seq_len(ncol(X_mat))]
+  )
+
+  # 4. Tune alpha and lambda using inner cross-validation
+  combined_model <- caret::train(
+    x = X_train,
+    y = y_train,
+    method = "glmnet",
+    tuneGrid = elastic_net_grid,
+    trControl = trainControl(
+      method = "cv",
+      number = 5,
+      summaryFunction = rmse_only
+    ),
+    metric = "RMSE",
+    preProcess = c("zv", "center", "scale"),
+    standardize = FALSE
+  )
+
+  # 5. Predict held-out participants
+  combined_predictions[test_idx] <- as.numeric(
+    predict(combined_model, newdata = X_test)
+  )
+
+  # 6. Store selected parameters
+  combined_alphas[i] <- combined_model$bestTune$alpha
+  combined_lambdas[i] <- combined_model$bestTune$lambda
+}
+
+# Check that all 29 participants received predictions
+stopifnot(
+  !anyNA(combined_predictions),
+  all(is.finite(combined_predictions))
+)
+
+```
+
+### RMSE and R\^2 
+
+```{r}
+
+# RMSE for combined model
+rmse_combined <- sqrt(
+  mean((y_vec - combined_predictions)^2)
+)
+
+# Cross-validated R-squared
+r2_combined <- 1 -
+  sum((y_vec - combined_predictions)^2) /
+  sum((y_vec - mean(y_vec))^2)
+
+# Compare all four models
+model_comparison <- data.frame(
+  Model = c(
+    "Mean-only baseline",
+    "Age + sex",
+    "Gene-expression elastic net",
+    "Combined elastic net"
+  ),
+  RMSE = c(
+    rmse_baseline,
+    rmse_clinical,
+    rmse_elastic_net,
+    rmse_combined
+  ),
+  R2 = c(
+    r2_baseline,
+    r2_clinical,
+    r2_elastic_net,
+    r2_combined
+  )
+)
+
+model_comparison
+
+# Selected alpha and lambda in each outer fold
+data.frame(
+  fold = seq_along(folds),
+  alpha = combined_alphas,
+  lambda = combined_lambdas,
+  genes_retained = combined_genes_retained
+)
+
+
+```
+
+The gene-expression-only model performed best, although its advantage over the mean-only baseline was extremely small.
+
+The combined model performed worse than both gene expression alone and the mean-only baseline.
+
+### Plot
+
+```{r}
+
+combined_results <- data.frame(
+  observed = y_vec,
+  predicted = combined_predictions
+)
+
+ggplot(
+  combined_results,
+  aes(x = observed, y = predicted)
+) +
+  geom_point(size = 2.5) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  coord_equal() +
+  labs(
+    title = "Combined Elastic Net: Observed vs Predicted",
+    subtitle = "Gene expression + age + sex",
+    x = "Observed Day 7 plasmablast frequency",
+    y = "Predicted Day 7 plasmablast frequency"
+  ) +
+  theme_minimal()
+
+```
