@@ -12,6 +12,7 @@ library(tidyverse)
 library(caret)
 library(glmnet)
 library(here)
+library(dplyr)
 
 
 # Load the merged TPM dataset
@@ -19,6 +20,7 @@ analysis_tpm <- readRDS(here("data", "processed", "analysis_tpm.rds"))
 
 # Check dimensions
 dim(analysis_tpm)
+
 ```
 
 ### Separate the outcome and predictors
@@ -595,7 +597,7 @@ stopifnot(
 
 ```
 
-### RMSE and R\^2 
+### RMSE and R\^2
 
 ```{r}
 
@@ -675,5 +677,589 @@ ggplot(
     y = "Predicted Day 7 plasmablast frequency"
   ) +
   theme_minimal()
+
+```
+
+### Sensitivity analysis: Log-transforming the outcome
+
+```{r}
+# Log-transform Day 7 plasmablast frequency
+y_log <- log(y_vec)
+
+# Compare distributions
+par(mfrow = c(1, 2))
+
+hist(
+  y_vec,
+  main = "Original plasmablast frequency",
+  xlab = "Day 7 plasmablast frequency"
+)
+
+hist(
+  y_log,
+  main = "Log-transformed frequency",
+  xlab = "Log(Day 7 plasmablast frequency)"
+)
+
+par(mfrow = c(1, 1))
+
+summary(y_log)
+```
+
+#### Fit the elastic net using this log-transformed outcome
+
+```{r}
+# Store predictions and selected hyperparameters
+log_predictions <- rep(NA_real_, length(y_vec))
+
+log_alphas <- rep(NA_real_, length(folds))
+log_lambdas <- rep(NA_real_, length(folds))
+# Wider lambda grid for the log-transformed outcome
+log_elastic_net_grid <- expand.grid(
+  alpha = c(0, 0.25, 0.5, 0.75, 1),
+  lambda = c(
+    0.000001,
+    0.00001,
+    0.0001,
+    0.001,
+    0.01,
+    0.05,
+    0.1,
+    0.2,
+    0.5,
+    1
+  )
+)
+
+for (i in seq_along(folds)) {
+  cat("Running log-transformed model - outer fold", i, "\n")
+
+  test_idx <- folds[[i]]
+
+  # Split expression data
+  X_train <- X_mat[-test_idx, , drop = FALSE]
+  X_test <- X_mat[test_idx, , drop = FALSE]
+
+  # Use log-transformed outcome
+  y_train <- y_log[-test_idx]
+
+  # Remove zero-variance genes using training data only
+  keep_genes <- apply(X_train, 2, var) > 0
+
+  X_train <- X_train[, keep_genes, drop = FALSE]
+  X_test <- X_test[, keep_genes, drop = FALSE]
+
+  # Fit elastic net with inner 5-fold CV
+  log_model <- caret::train(
+    x = X_train,
+    y = y_train,
+    method = "glmnet",
+    tuneGrid = log_elastic_net_grid,
+    trControl = trainControl(
+      method = "cv",
+      number = 5,
+      summaryFunction = rmse_only
+    ),
+    metric = "RMSE",
+    preProcess = c("zv", "center", "scale"),
+    standardize = FALSE
+  )
+
+  # Predict on log scale and back-transform
+  pred_log <- predict(log_model, newdata = X_test)
+
+  log_predictions[test_idx] <- exp(pred_log)
+
+  # Save selected parameters
+  log_alphas[i] <- log_model$bestTune$alpha
+  log_lambdas[i] <- log_model$bestTune$lambda
+}
+```
+
+#### Compare predictive performance
+
+```{r}
+# Performance on original outcome scale
+log_rmse <- sqrt(mean((y_vec - log_predictions)^2))
+
+log_r2 <- 1 -
+  sum((y_vec - log_predictions)^2) /
+  sum((y_vec - mean(y_vec))^2)
+
+# Compare models
+data.frame(
+  Model = c(
+    "Original outcome",
+    "Log-transformed outcome"
+  ),
+  RMSE = c(
+    sqrt(mean((y_vec - elastic_net_predictions)^2)),
+    log_rmse
+  ),
+  R2 = c(
+    1 - sum((y_vec - elastic_net_predictions)^2) /
+      sum((y_vec - mean(y_vec))^2),
+    log_r2
+  )
+)
+
+data.frame(
+  Fold = seq_along(folds),
+  Alpha = log_alphas,
+  Lambda = log_lambdas
+)
+```
+
+#### Visualize
+
+```{r}
+ggplot(
+  data.frame(
+    Observed = y_vec,
+    Predicted = log_predictions
+  ),
+  aes(x = Observed, y = Predicted)
+) +
+  geom_point(size = 2.5, alpha = 0.7) +
+  geom_abline(
+    intercept = 0,
+    slope = 1,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Elastic net with log-transformed outcome",
+    x = "Observed Day 7 plasmablast frequency",
+    y = "Predicted Day 7 plasmablast frequency"
+  ) +
+  theme_minimal()
+```
+
+#### Check individuals with high prediction error
+
+```{r}
+# Compare prediction errors between original and log-transformed models
+error_comparison <- data.frame(
+  participant_id = analysis_tpm$participant_id,
+  observed = y_vec,
+  original_predicted = elastic_net_predictions,
+  log_predicted = log_predictions
+) %>%
+  mutate(
+    original_squared_error = (observed - original_predicted)^2,
+    log_squared_error = (observed - log_predicted)^2,
+    original_error_percent = 100 * original_squared_error /
+      sum(original_squared_error),
+    log_error_percent = 100 * log_squared_error /
+      sum(log_squared_error)
+  )
+
+# Show participants with the largest errors in the log model
+error_comparison %>%
+  arrange(desc(log_squared_error)) %>%
+  select(
+    participant_id,
+    observed,
+    original_error_percent,
+    log_error_percent
+  ) %>%
+  head(10)
+
+```
+
+#### compare three largest errors
+
+```{r}
+# Identify the three largest errors in each model
+top3_original <- error_comparison %>%
+  slice_max(original_squared_error, n = 3)
+
+top3_log <- error_comparison %>%
+  slice_max(log_squared_error, n = 3)
+
+# Compare their contributions
+data.frame(
+  Model = c("Original outcome", "Log-transformed outcome"),
+  Top_3_Error_Percent = c(
+    sum(top3_original$original_error_percent),
+    sum(top3_log$log_error_percent)
+  )
+)
+
+# Check whether they are the same participants
+intersect(
+  top3_original$participant_id,
+  top3_log$participant_id
+)
+```
+
+#### check the original 3 participants specifically
+
+```{r}
+# Contribution of the original top three participants
+error_comparison %>%
+  filter(participant_id %in% top3_original$participant_id) %>%
+  select(
+    participant_id,
+    observed,
+    original_error_percent,
+    log_error_percent
+  )
+
+# Their combined contributions to each model
+error_comparison %>%
+  filter(participant_id %in% top3_original$participant_id) %>%
+  summarise(
+    Original_total_percent = sum(original_error_percent),
+    Log_total_percent = sum(log_error_percent)
+  )
+```
+
+## Add vaccine history
+
+```{r}
+# Load vaccination history
+vaccine_hist <- readRDS(
+  here("data", "vaccine_hist.rds")
+)
+
+# Identify participants with documented history
+# The vaccine history dataset uses the subject identifier
+vax_available <- analysis_tpm$subject %in% vaccine_hist$subject
+
+# Check availability
+table(vax_available)
+
+# Examine vaccination counts among participants with records
+summary(analysis_tpm$n_prior_vax[vax_available])
+
+# Check the two participants without documented history
+analysis_tpm %>%
+  filter(!vax_available) %>%
+  select(participant_id, subject, n_prior_vax)
+
+```
+
+#### create 27-participant dataset
+
+```{r}
+# Keep only participants with documented vaccination history
+analysis_vax <- analysis_tpm[vax_available, ]
+
+# Corresponding gene expression and outcome
+X_vax <- X_mat[vax_available, , drop = FALSE]
+y_vax <- y_vec[vax_available]
+
+# Age and sex predictors
+demographic_vax <- model.matrix(
+  ~ age + biological_sex,
+  data = analysis_vax
+)[, -1, drop = FALSE]
+
+# Age, sex, and vaccination history predictors
+demographic_vax_history <- model.matrix(
+  ~ age + biological_sex + n_prior_vax,
+  data = analysis_vax
+)[, -1, drop = FALSE]
+
+# Create three predictor matrices
+X_vax_gene <- X_vax
+
+X_vax_demographic <- cbind(
+  X_vax,
+  demographic_vax
+)
+
+X_vax_full <- cbind(
+  X_vax,
+  demographic_vax_history
+)
+
+# Verify dimensions and missingness
+dim(X_vax_gene)
+dim(X_vax_demographic)
+dim(X_vax_full)
+
+stopifnot(
+  length(y_vax) == 27,
+  !anyNA(X_vax_full),
+  !anyNA(y_vax)
+)
+
+```
+
+#### Create outer cross validation folds
+
+```{r}
+set.seed(123)
+
+folds_vax <- createFolds(
+  y_vax,
+  k = 5,
+  list = TRUE
+)
+
+sapply(folds_vax, length)
+```
+
+#### fit the three models with vaccine history now (on the same 27 participants rather than 29)
+
+```{r}
+# Predictor matrices for the three models
+vax_models <- list(
+  "Gene expression" = X_vax_gene,
+  "Genes + age + sex" = X_vax_demographic,
+  "Genes + age + sex + vaccination history" = X_vax_full
+)
+
+# Store predictions for each model
+vax_predictions <- list()
+
+for (model_name in names(vax_models)) {
+
+  cat("\nRunning model:", model_name, "\n")
+
+  X_current <- vax_models[[model_name]]
+
+  predictions <- rep(NA_real_, length(y_vax))
+
+  for (i in seq_along(folds_vax)) {
+
+    cat("Outer fold", i, "\n")
+
+    test_idx <- folds_vax[[i]]
+
+    X_train <- X_current[-test_idx, , drop = FALSE]
+    X_test <- X_current[test_idx, , drop = FALSE]
+
+    y_train <- y_vax[-test_idx]
+
+    # Remove zero-variance predictors using training data
+    keep_predictors <- apply(X_train, 2, var) > 0
+
+    X_train <- X_train[, keep_predictors, drop = FALSE]
+    X_test <- X_test[, keep_predictors, drop = FALSE]
+
+    # Fit elastic net with inner cross-validation
+    model <- caret::train(
+      x = X_train,
+      y = y_train,
+      method = "glmnet",
+      tuneGrid = elastic_net_grid,
+      trControl = trainControl(
+        method = "cv",
+        number = 5,
+        summaryFunction = rmse_only
+      ),
+      metric = "RMSE",
+      preProcess = c("zv", "center", "scale"),
+      standardize = FALSE
+    )
+
+    predictions[test_idx] <- as.numeric(
+      predict(model, newdata = X_test)
+    )
+  }
+
+  vax_predictions[[model_name]] <- predictions
+}
+```
+
+#### compare performance
+
+```{r}
+# Training-mean predictions for the 27-participant cohort
+vax_baseline_predictions <- rep(NA_real_, length(y_vax))
+
+for (i in seq_along(folds_vax)) {
+  test_idx <- folds_vax[[i]]
+
+  vax_baseline_predictions[test_idx] <- mean(y_vax[-test_idx])
+}
+
+# Calculate baseline performance
+baseline_rmse_vax <- sqrt(
+  mean((y_vax - vax_baseline_predictions)^2)
+)
+
+baseline_r2_vax <- 1 -
+  sum((y_vax - vax_baseline_predictions)^2) /
+  sum((y_vax - mean(y_vax))^2)
+
+data.frame(
+  Model = "Training-mean baseline (n = 27)",
+  RMSE = baseline_rmse_vax,
+  R2 = baseline_r2_vax
+)
+
+vax_results <- data.frame(
+  Model = c(
+    "Training-mean baseline",
+    names(vax_predictions)
+  ),
+  RMSE = c(
+    baseline_rmse_vax,
+    sapply(
+      vax_predictions,
+      function(p) sqrt(mean((y_vax - p)^2))
+    )
+  ),
+  R2 = c(
+    baseline_r2_vax,
+    sapply(
+      vax_predictions,
+      function(p) {
+        1 - sum((y_vax - p)^2) /
+          sum((y_vax - mean(y_vax))^2)
+      }
+    )
+  ),
+  row.names = NULL
+)
+
+vax_results
+```
+
+### Try imputation instead of restriction (29 participants)
+
+impute with population median
+
+we'll calculate the vaccination-history median separately within each training fold to avoid information leakage
+
+```{r}
+# =========================================================
+# Sensitivity analysis: Median imputation (n = 29)
+# =========================================================
+
+# Create vaccination history variable
+# Missing history is represented by NA, not zero
+
+vax_count <- analysis_tpm$n_prior_vax
+
+vax_count[!vax_available] <- NA_real_
+
+# Check missing values
+sum(is.na(vax_count))
+
+# Examine documented vaccination counts
+summary(vax_count)
+```
+
+#### fit elastic net with training-fold median imputation
+
+```{r}
+# Store predictions and selected hyperparameters
+vax_imputed_predictions <- rep(NA_real_, length(y_vec))
+
+vax_imputed_alphas <- rep(NA_real_, length(folds))
+vax_imputed_lambdas <- rep(NA_real_, length(folds))
+
+for (i in seq_along(folds)) {
+
+  cat("Running imputed vaccination model - fold", i, "\n")
+
+  test_idx <- folds[[i]]
+
+  # Separate training and testing data
+  X_train <- X_combined[-test_idx, , drop = FALSE]
+  X_test <- X_combined[test_idx, , drop = FALSE]
+
+  y_train <- y_vec[-test_idx]
+
+  # Separate vaccination history
+  vax_train <- vax_count[-test_idx]
+  vax_test <- vax_count[test_idx]
+
+  # Calculate median using training participants only
+  training_median <- median(vax_train, na.rm = TRUE)
+
+  # Impute missing vaccination histories
+  vax_train[is.na(vax_train)] <- training_median
+  vax_test[is.na(vax_test)] <- training_median
+
+  # Add vaccination history to predictor matrices
+  X_train <- cbind(X_train, n_prior_vax = vax_train)
+  X_test <- cbind(X_test, n_prior_vax = vax_test)
+
+  # Remove zero-variance predictors using training data
+  keep_predictors <- apply(X_train, 2, var) > 0
+
+  X_train <- X_train[, keep_predictors, drop = FALSE]
+  X_test <- X_test[, keep_predictors, drop = FALSE]
+
+  # Fit elastic net with inner cross-validation
+  model <- caret::train(
+    x = X_train,
+    y = y_train,
+    method = "glmnet",
+    tuneGrid = elastic_net_grid,
+    trControl = trainControl(
+      method = "cv",
+      number = 5,
+      summaryFunction = rmse_only
+    ),
+    metric = "RMSE",
+    preProcess = c("zv", "center", "scale"),
+    standardize = FALSE
+  )
+
+  # Predict held-out participants
+  vax_imputed_predictions[test_idx] <- as.numeric(
+    predict(model, newdata = X_test)
+  )
+
+  # Store selected hyperparameters
+  vax_imputed_alphas[i] <- model$bestTune$alpha
+  vax_imputed_lambdas[i] <- model$bestTune$lambda
+}
+
+# Check predictions
+stopifnot(
+  !anyNA(vax_imputed_predictions),
+  all(is.finite(vax_imputed_predictions))
+)
+```
+
+#### compare results
+
+```{r}
+# Calculate performance
+rmse_vax_imputed <- sqrt(
+  mean((y_vec - vax_imputed_predictions)^2)
+)
+
+r2_vax_imputed <- 1 -
+  sum((y_vec - vax_imputed_predictions)^2) /
+  sum((y_vec - mean(y_vec))^2)
+
+# Compare all models using the same 29 participants
+imputation_results <- data.frame(
+  Model = c(
+    "Training-mean baseline",
+    "Genes + age + sex",
+    "Genes + age + sex + imputed vaccination history"
+  ),
+  RMSE = c(
+    rmse_baseline,
+    rmse_combined,
+    rmse_vax_imputed
+  ),
+  R2 = c(
+    r2_baseline,
+    r2_combined,
+    r2_vax_imputed
+  )
+)
+
+imputation_results
+```
+
+#### check selected hyperparameters
+
+```{r}
+data.frame(
+  Fold = seq_along(folds),
+  Alpha = vax_imputed_alphas,
+  Lambda = vax_imputed_lambdas
+)
 
 ```
