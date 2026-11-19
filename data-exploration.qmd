@@ -209,3 +209,46 @@ table1
 
 gt::gtsave(as_gt(table1), here("output", "table1.png"))
 ```
+
+```{r}
+# Create Table 1 using documented vaccination histories only
+table1 <- cohort %>%
+  select(age, biological_sex, n_prior_vax, value, subject) %>%
+  mutate(
+    n_prior_vax = if_else(
+      subject %in% vaccine_hist$subject,
+      n_prior_vax,
+      NA_real_
+    )
+  ) %>%
+  select(-subject) %>%
+  tbl_summary(
+    type = list(n_prior_vax ~ "continuous"),
+    label = list(
+      age            ~ "Age (years)",
+      biological_sex ~ "Sex",
+      n_prior_vax    ~ "Number of prior vaccinations",
+      value          ~ "Plasmablast frequency at day 7 (%)"
+    ),
+    statistic = list(
+      all_continuous()  ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(value ~ 4),
+    missing = "ifany",
+    missing_text = "Unknown"
+  ) %>%
+  bold_labels() %>%
+  modify_caption("**Table 1. Characteristics of the study cohort**")
+
+# Display table
+table1
+
+# Save table as PNG
+dir.create(here("output"), showWarnings = FALSE)
+
+gt::gtsave(
+  as_gt(table1),
+  here("output", "table1.png")
+)
+```
