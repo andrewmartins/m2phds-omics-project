@@ -177,7 +177,15 @@ table1 = cohort %>%
   tbl_summary()
 
 table1 <- cohort %>%
-  select(age, biological_sex, n_prior_vax, value) %>%
+  select(age, biological_sex, n_prior_vax, value, subject) %>%
+  mutate(
+    n_prior_vax = if_else(
+      subject %in% vaccine_hist$subject,
+      n_prior_vax,
+      NA_real_
+    )
+) %>%
+select(-subject) %>%
   tbl_summary(
     type = list(n_prior_vax ~ "continuous"),
     label = list(
