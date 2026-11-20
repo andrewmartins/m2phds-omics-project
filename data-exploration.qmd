@@ -22,13 +22,21 @@ result = left_join(cohort, rnaseq, by = "participant_id") %>%
     counts = sum(counts)
   )
 
-cohort
+vaccine_hist[vaccine_hist$participant_id %in% cohort_missing_vax$participant_id,]
+
+cohort_missing_vax = cohort %>%
+  filter(n_prior_vax == 0)
+
+cohort_missing_vax$
+
 rnaseq %>%
   group_by(material) %>%
   summarise(
     counts = n()
   )
 result
+
+
 
 
 ct <- cor.test(result$n_prior_vax, result$counts, method = "spearman", exact = FALSE)

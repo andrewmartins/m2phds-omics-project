@@ -30,6 +30,8 @@
 # 1. Load packages and data -------------------------------
 
 library(tidyverse)
+library(edgeR)
+library(sva)
 
 participants <- readRDS("data/participants_cleaned.rds")
 rnaseq <- readRDS("data/rnaseq.rds")
@@ -61,8 +63,11 @@ outcome <- participants %>%
     subject,
     biological_sex,
     age,
-    n_prior_vax,
-    plasmablast_frequency = value
+    plasmablast_frequency = value,
+    n_prior_vax
+  ) %>%
+  mutate(
+    transf_plasmablast_frequency = log(plasmablast_frequency)
   )
 
 
@@ -128,7 +133,6 @@ rnaseq_d0 <- rnaseq %>%
     counts,
     tpm
   )
-
 
 # Check number of unique participants and genes
 n_distinct(rnaseq_d0$participant_id)
@@ -209,13 +213,13 @@ if (length(common_ids) != 29) {
   warning("Matched population differs from expected n = 29.")
 }
 
-# 7. PIVOT RNA-SEQ INTO WIDE FORMAT ----------------------------
+# 7. PIVOT RNA-SEQ INTO WIDE FORMAT AND RENORMALIZE ----------------------------
 
 # Currently RNA-seq is in long format:
 # participant_id | ensembl_gene_id | counts | tpm
 #
 # For modeling, we need:
-# participant_id | Gene1 | Gene2 | Gene3 | ...
+# participant_id | Gene1 | Gene2 | Gene3 | ... 
 #
 # We create two separate matrices to avoid mixing
 # raw counts and TPM values in the same model.
@@ -238,6 +242,16 @@ rnaseq_tpm_wide <- rnaseq_d0 %>%
     values_from = tpm
   )
 
+# C. Add n_prior_vax and vax_history_available to the RNA-seq count matrix
+
+rnaseq_counts_tmm_wide <- rnaseq_counts_wide %>%
+  left_join(
+    outcome %>%
+      select(participant_id, n_prior_vax),
+    by = "participant_id"
+  )
+
+
 # Check dimensions
 dim(rnaseq_counts_wide)
 # 29, 78933
@@ -246,6 +260,24 @@ dim(rnaseq_tpm_wide)
 
 # Each row should represent one participant.
 # Each gene should be a separate column.
+
+gene_cols <- c(2:ncol(rnaseq_counts_tmm_wide)) # columns with gene counts
+
+# Normalizing raw-count matrix with TMM method
+
+dge_tmm <- DGEList(t(rnaseq_counts_tmm_wide[,gene_cols]))
+
+keep <- filterByExpr(dge_tmm)
+
+dge_tmm <- dge_tmm[keep, , keep.lib.sizes=FALSE] %>%
+  calcNormFactors(method = "TMM")
+
+counts_log2_cpm_tmm <- cpm(dge_tmm, log = TRUE) %>%
+  t() %>%
+  as.data.frame()
+
+counts_log2_cpm_tmm$participant_id = rnaseq_counts_wide$participant_id
+
 
 # 8. MERGE WITH PARTICIPANT INFORMATION -----------------------
 
@@ -272,11 +304,19 @@ analysis_tpm <- outcome %>%
     by = "participant_id"
   )
 
+# C. TMM analysis dataset
 
-# C. Participant metadata only
+analysis_tmm <- outcome %>%
+  inner_join(
+    counts_log2_cpm_tmm,
+    by = "participant_id"
+  )
+
+# D. Participant metadata only
 
 analysis_metadata <- outcome %>%
   filter(participant_id %in% common_ids)
+
 
 
 # 9. VERIFY MATCHING AND DATA STRUCTURE -----------------------
@@ -284,7 +324,8 @@ analysis_metadata <- outcome %>%
 # Ensure one row per participant
 stopifnot(
   !anyDuplicated(analysis_counts$participant_id),
-  !anyDuplicated(analysis_tpm$participant_id)
+  !anyDuplicated(analysis_tpm$participant_id),
+  !anyDuplicated(analysis_tmm$participant_id)
 )
 
 # Check that both datasets contain the same participants
@@ -295,16 +336,25 @@ stopifnot(
   )
 )
 
-# Check that both expression matrices contain the same genes
-gene_cols <- setdiff(
-  names(rnaseq_counts_wide),
-  "participant_id"
+stopifnot(
+  setequal(
+    analysis_counts$participant_id,
+    analysis_tmm$participant_id
+  )
 )
+
+
+# Check that both expression matrices contain the same genes
+gene_cols <- 
+setdiff(
+    names(rnaseq_counts_wide),
+    "participant_id"
+  )
 
 stopifnot(
   setequal(
     gene_cols,
-    setdiff(names(rnaseq_tpm_wide), "participant_id")
+    setdiff(names(counts_log2_cpm_tmm), "participant_id")
   )
 )
 
@@ -313,6 +363,9 @@ analysis_counts <- analysis_counts %>%
   arrange(participant_id)
 
 analysis_tpm <- analysis_tpm %>%
+  arrange(participant_id)
+
+analysis_tmm <- analysis_tmm %>%
   arrange(participant_id)
 
 analysis_metadata <- analysis_metadata %>%
@@ -327,6 +380,10 @@ stopifnot(
   identical(
     analysis_counts$participant_id,
     analysis_metadata$participant_id
+  ),
+  identical(
+    analysis_counts$participant_id,
+    analysis_tmm$participant_id
   )
 )
 
@@ -335,7 +392,11 @@ stopifnot(
   identical(
     analysis_counts$plasmablast_frequency,
     analysis_tpm$plasmablast_frequency
-  )
+  ),
+  identical(
+    analysis_counts$plasmablast_frequency,
+    analysis_tmm$plasmablast_frequency
+  ),
 )
 
 # Report missing gene-expression values
@@ -345,6 +406,10 @@ cat("Missing raw-count values:",
 
 cat("Missing TPM values:",
     sum(is.na(analysis_tpm[, gene_cols])), "\n")
+# 0
+
+cat("Missing TPM values:",
+    sum(is.na(analysis_tmm[, gene_cols])), "\n")
 # 0
 
 # Missing expression entries are NOT automatically set to zero.
@@ -369,6 +434,10 @@ cat("Raw-count dataset dimensions:",
 
 cat("TPM dataset dimensions:",
     dim(analysis_tpm), "\n")
+# 29, 78939
+
+cat("TPM dataset dimensions:",
+    dim(analysis_tmm), "\n")
 # 29, 78939
 
 # Outcome summary
@@ -404,6 +473,16 @@ saveRDS(
 saveRDS(
   analysis_tpm,
   "data/processed/analysis_tpm.rds"
+)
+
+saveRDS(
+  analysis_tpm,
+  "data/processed/analysis_tmm.rds"
+)
+
+saveRDS(
+  dge_tmm,
+  "data/processed/dge_tmm.rds"
 )
 
 saveRDS(

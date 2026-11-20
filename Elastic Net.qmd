@@ -595,7 +595,7 @@ stopifnot(
 
 ```
 
-### RMSE and R\^2 
+### RMSE and R\^2
 
 ```{r}
 
