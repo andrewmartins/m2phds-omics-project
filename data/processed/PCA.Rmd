@@ -1,0 +1,47 @@
+---
+title: "OMICS-PCA"
+author: "K. Sangué Coulibaly"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+
+analysis_tpm <- readRDS("analysis_tpm.rds")
+
+# visualizing cleaned data
+analysis_tpm[, 1:10] %>%
+  head(5)
+
+# Creating a vector containing the names of all the gene columns
+gene_columns <- 9:ncol(analysis_tpm)
+
+# convert gene columns to numeric
+analysis_tpm <- analysis_tpm %>%
+  mutate(across(all_of(gene_columns), as.numeric))
+
+# Calculate the total expression for each gene
+gene_totals <- colSums(analysis_tpm[, gene_columns],
+                       na.rm = TRUE)
+
+# Verify whether there are genes with total count of zero
+gene_totals[gene_totals == 0]
+
+expressed_genes <- analysis_tpm %>%
+  filter(rowSums(across(-gene_columns))>0)
+
+
+# Number of genes before filtering
+nrow(analysis_tpm)
+
+# Number of genes after filtering
+nrow(expressed_genes)
+```
+
+
+## R Markdown
