@@ -1,0 +1,475 @@
+---
+title: "Random forest"
+author: "Group 2"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library("randomForest")
+library("caret")
+library("tidyverse")
+```
+
+## Set up 
+
+```{r}
+# Loading the dataset
+analysis_tpm <- readRDS("analysis_tpm.rds")
+
+# visualizing dataset
+analysis_tpm[, 1:10] %>%
+  head(5)
+
+# removing unexpressed genes
+gene_columns <- 8:ncol(analysis_tpm)
+
+analysis_tpm <- analysis_tpm %>%
+  mutate(across(all_of(gene_columns), as.numeric))
+
+gene_totals <- colSums(analysis_tpm[, gene_columns],
+                       na.rm = TRUE)
+
+expressed_genes <- names(gene_totals[gene_totals > 0])
+```
+
+```{r}
+# Outcome
+Y <- analysis_tpm$plasmablast_frequency
+
+X_genes <- as.matrix(analysis_tpm[, expressed_genes, drop = FALSE])
+```
+
+Running rf at this stage failed due to the huge number of genes. 
+Let's select the top 500 most variable genes within training folds as an exploratory starting point. 
+
+```{r}
+select_top_genes <- function(X, n_genes = 500) {
+
+  gene_variance <- apply(X, 2, var)
+
+  gene_variance <- gene_variance[
+    is.finite(gene_variance) & gene_variance > 0
+  ]
+
+  selected_genes <- names(
+    sort(gene_variance, decreasing = TRUE)
+  )[seq_len(min(n_genes, length(gene_variance)))]
+
+  selected_genes
+}
+
+## tuning parameters 
+rf_grid <- c(5, 15, 30)
+```
+
+## Run LOOCV 
+
+Outer LOOCV: holds out one participant to evaluate prediction
+Inner LOOCV: tunes mtry using only the 28 outer-training participants
+
+```{r}
+# Store predictions
+rf_predictions <- rep(NA_real_, length(Y))
+
+# Store baseline predictions
+rf_baseline_predictions <- rep(NA_real_, length(Y))
+
+# Store best mtry
+rf_best_mtry <- rep(NA_integer_, length(Y))
+
+# Store variable importance
+rf_importance <- vector("list", length(Y))
+
+set.seed(123)
+
+# OUTER LOOCV
+for (i in seq_along(Y)) {
+
+  cat("Outer LOOCV:", i, "of", length(Y), "\n")
+
+  # Hold out one participant
+  X_train <- X_genes[-i, , drop = FALSE]
+  X_test <- X_genes[i, , drop = FALSE]
+
+  y_train <- Y[-i]
+
+  # Store inner CV RMSE
+  inner_rmse <- rep(NA_real_, length(rf_grid))
+
+  # INNER LOOCV: tune mtry
+  for (j in seq_along(rf_grid)) {
+
+    inner_predictions <- rep(NA_real_, length(y_train))
+
+    for (k in seq_along(y_train)) {
+
+      # Hold out one participant from outer training set
+      X_inner_train <- X_train[-k, , drop = FALSE]
+      X_inner_val <- X_train[k, , drop = FALSE]
+
+      y_inner_train <- y_train[-k]
+
+      # Select genes using inner training participants only
+      selected_genes <- select_top_genes(
+        X_inner_train,
+        n_genes = 500
+      )
+
+      X_inner_train_selected <- X_inner_train[
+        , selected_genes, drop = FALSE
+      ]
+
+      X_inner_val_selected <- X_inner_val[
+        , selected_genes, drop = FALSE
+      ]
+
+      # Fit Random Forest
+      rf_model <- randomForest(
+        x = X_inner_train_selected,
+        y = y_inner_train,
+        ntree = 500,
+        mtry = min(rf_grid[j], length(selected_genes))
+      )
+
+      # Predict held-out inner participant
+      inner_predictions[k] <- predict(
+        rf_model,
+        newdata = X_inner_val_selected
+      )
+    }
+
+    # Inner LOOCV RMSE
+    inner_rmse[j] <- sqrt(
+      mean((y_train - inner_predictions)^2)
+    )
+  }
+
+  # Select best mtry
+  best_mtry <- rf_grid[which.min(inner_rmse)]
+
+  rf_best_mtry[i] <- best_mtry
+
+  # Select genes using all 28 outer training participants
+  selected_genes <- select_top_genes(
+    X_train,
+    n_genes = 500
+  )
+
+  X_train_selected <- X_train[
+    , selected_genes, drop = FALSE
+  ]
+
+  X_test_selected <- X_test[
+    , selected_genes, drop = FALSE
+  ]
+
+  # Fit final outer model
+  rf_final <- randomForest(
+    x = X_train_selected,
+    y = y_train,
+    ntree = 1000,
+    mtry = min(best_mtry, length(selected_genes)),
+    importance = TRUE
+  )
+
+  # Predict held-out participant
+  rf_predictions[i] <- predict(
+    rf_final,
+    newdata = X_test_selected
+  )
+
+  # Baseline prediction
+  rf_baseline_predictions[i] <- mean(y_train)
+
+  # Store variable importance
+  imp <- importance(rf_final, type = 1)
+
+  rf_importance[[i]] <- data.frame(
+    gene = rownames(imp),
+    importance = as.numeric(imp[, 1])
+  )
+}
+```
+## Performance calculation
+
+```{r}
+# Random Forest
+rf_rmse <- sqrt(
+  mean((Y - rf_predictions)^2)
+)
+
+rf_r2 <- 1 -
+  sum((Y - rf_predictions)^2) /
+  sum((Y - mean(Y))^2)
+
+# Baseline
+rf_baseline_rmse <- sqrt(
+  mean((Y - rf_baseline_predictions)^2)
+)
+
+rf_baseline_r2 <- 1 -
+  sum((Y - rf_baseline_predictions)^2) /
+  sum((Y - mean(Y))^2)
+
+# Compare
+data.frame(
+  Model = c("Random Forest", "Baseline"),
+  RMSE = c(rf_rmse, rf_baseline_rmse),
+  R_squared = c(rf_r2, rf_baseline_r2)
+)
+
+## tunning results
+data.frame(
+  Participant = seq_along(Y),
+  Best_mtry = rf_best_mtry
+)
+```
+Compared with the baseline RMSE of 0.0079, Random Forest has improved predictive accuracy.
+
+# Re-running everythiing on the log transformed 
+
+```{r} 
+# Log-transform Day 7 plasmablast frequency
+y_log <- log(Y)
+
+summary(y_log)
+```
+## Run LOOCV on the log transformed
+
+```{r}
+# Store predictions
+log_rf_predictions <- rep(NA_real_, length(y_log))
+
+# Store baseline predictions
+log_rf_baseline_predictions <- rep(NA_real_, length(y_log))
+
+# Store best mtry
+log_rf_best_mtry <- rep(NA_integer_, length(y_log))
+
+# Store variable importance
+rf_importance <- vector("list", length(y_log))
+
+set.seed(123)
+
+# OUTER LOOCV
+for (i in seq_along(y_log)) {
+
+  cat("Outer LOOCV:", i, "of", length(y_log), "\n")
+
+  # Hold out one participant
+  X_train <- X_genes[-i, , drop = FALSE]
+  X_test <- X_genes[i, , drop = FALSE]
+
+  y_train <- y_log[-i]
+
+  # Store inner CV RMSE
+  inner_rmse <- rep(NA_real_, length(rf_grid))
+
+  # INNER LOOCV: tune mtry
+  for (j in seq_along(rf_grid)) {
+
+    inner_predictions <- rep(NA_real_, length(y_train))
+
+    for (k in seq_along(y_train)) {
+
+      # Hold out one participant from outer training set
+      X_inner_train <- X_train[-k, , drop = FALSE]
+      X_inner_val <- X_train[k, , drop = FALSE]
+
+      y_inner_train <- y_train[-k]
+
+      # Select genes using inner training participants only
+      selected_genes <- select_top_genes(
+        X_inner_train,
+        n_genes = 500
+      )
+
+      X_inner_train_selected <- X_inner_train[
+        , selected_genes, drop = FALSE
+      ]
+
+      X_inner_val_selected <- X_inner_val[
+        , selected_genes, drop = FALSE
+      ]
+
+      # Fit Random Forest
+      log_rf_model <- randomForest(
+        x = X_inner_train_selected,
+        y = y_inner_train,
+        ntree = 500,
+        mtry = min(rf_grid[j], length(selected_genes))
+      )
+
+      # Predict held-out inner participant
+      inner_predictions[k] <- predict(
+        log_rf_model,
+        newdata = X_inner_val_selected
+      )
+    }
+
+    # Inner LOOCV RMSE
+    inner_rmse[j] <- sqrt(
+      mean((y_train - inner_predictions)^2)
+    )
+  }
+
+  # Select best mtry
+  log_best_mtry <- rf_grid[which.min(inner_rmse)]
+
+  rf_best_mtry[i] <- log_best_mtry
+
+  # Select genes using all 28 outer training participants
+  selected_genes <- select_top_genes(
+    X_train,
+    n_genes = 500
+  )
+
+  X_train_selected <- X_train[
+    , selected_genes, drop = FALSE
+  ]
+
+  X_test_selected <- X_test[
+    , selected_genes, drop = FALSE
+  ]
+
+  # Fit final outer model
+  log_rf_final <- randomForest(
+    x = X_train_selected,
+    y = y_train,
+    ntree = 1000,
+    mtry = min(log_best_mtry, length(selected_genes)),
+    importance = TRUE
+  )
+
+  # Predict held-out participant
+  log_rf_predictions[i] <- predict(
+    log_rf_final,
+    newdata = X_test_selected
+  )
+
+  # Baseline prediction
+  log_rf_baseline_predictions[i] <- mean(y_train)
+
+  # Store variable importance
+  imp <- importance(log_rf_final, type = 1)
+
+  rf_importance[[i]] <- data.frame(
+    gene = rownames(imp),
+    importance = as.numeric(imp[, 1])
+  )
+}
+```
+## Performance calculation
+
+```{r}
+# Random Forest
+log_rf_rmse <- sqrt(
+  mean((y_log - log_rf_predictions)^2)
+)
+
+log_rf_r2 <- 1 -
+  sum((y_log - log_rf_predictions)^2) /
+  sum((y_log - mean(y_log))^2)
+
+# Baseline
+log_rf_baseline_rmse <- sqrt(
+  mean((y_log - log_rf_baseline_predictions)^2)
+)
+
+log_rf_baseline_r2 <- 1 -
+  sum((y_log - log_rf_baseline_predictions)^2) /
+  sum((y_log - mean(y_log))^2)
+
+# Compare
+data.frame(
+  Model = c("Log Random Forest", "Log Baseline"),
+  RMSE = c(log_rf_rmse, log_rf_baseline_rmse),
+  R_squared = c(log_rf_r2, log_rf_baseline_r2)
+)
+
+## tunning results
+data.frame(
+  Participant = seq_along(Y),
+  Best_mtry = rf_best_mtry
+)
+```
+
+
+```{r}
+# Back-transform Random Forest predictions
+log_rf_predictions_original <- exp(log_rf_predictions)
+
+# Back-transform baseline predictions
+log_rf_baseline_predictions_original <- exp(
+  log_rf_baseline_predictions
+)
+```
+ performance on the original scale 
+```{r}
+# Create comparison table
+
+model_comparison <- data.frame(
+
+  Model = c(
+    "Original Random Forest",
+    "Original Baseline",
+    "Log Random Forest (log scale)",
+    "Log Baseline (log scale)",
+    "Log Random Forest (original scale)",
+    "Log Baseline (original scale)"
+  ),
+
+  RMSE = c(
+
+    # Original Random Forest
+    rf_rmse,
+
+    # Original baseline
+    rf_baseline_rmse,
+
+    # Log Random Forest: log scale
+    log_rf_rmse,
+
+    # Log baseline: log scale
+    log_rf_baseline_rmse,
+
+    # Log Random Forest: back-transformed
+    sqrt(mean((Y - log_rf_predictions_original)^2)),
+
+    # Log baseline: back-transformed
+    sqrt(mean((Y - log_rf_baseline_predictions_original)^2))
+  ),
+
+  R_squared = c(
+
+    # Original Random Forest
+    rf_r2,
+
+    # Original baseline
+    rf_baseline_r2,
+
+    # Log Random Forest: log scale
+    log_rf_r2,
+
+    # Log baseline: log scale
+    log_rf_baseline_r2,
+
+    # Log Random Forest: back-transformed
+    1 - sum((Y - log_rf_predictions_original)^2) /
+      sum((Y - mean(Y))^2),
+
+    # Log baseline: back-transformed
+    1 - sum((Y - log_rf_baseline_predictions_original)^2) /
+      sum((Y - mean(Y))^2)
+  )
+)
+
+# Display results
+model_comparison
+```
+ This suggests that the log transformation did not improve the predictive performance of your Random Forest.
