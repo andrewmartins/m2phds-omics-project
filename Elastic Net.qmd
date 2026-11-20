@@ -527,6 +527,13 @@ log_elastic_net_grid <- expand.grid(
   )
 )
 
+## Recording genes for potential use in RF
+log_genes_available <- rep(NA_integer_, length(folds))
+log_genes_selected <- rep(NA_integer_, length(folds))
+
+# Store selected genes for each outer fold
+log_selected_genes_by_fold <- vector("list", length(folds))
+
 for (i in seq_along(folds)) {
   cat("Running log-transformed model - outer fold", i, "\n")
 
@@ -560,6 +567,29 @@ for (i in seq_along(folds)) {
     preProcess = c("zv", "center", "scale"),
     standardize = FALSE
   )
+  
+  # Number of genes available after variance filtering
+  log_genes_available[i] <- ncol(X_train)
+  
+  # Extract coefficients at selected lambda
+  selected_coefs <- coef(
+    log_model$finalModel,
+    s = log_model$bestTune$lambda
+  )
+  
+  # Identify genes with nonzero coefficients
+  selected_genes <- rownames(selected_coefs)[
+    as.vector(selected_coefs != 0)
+  ]
+  
+  # Remove intercept
+  selected_genes <- setdiff(selected_genes, "(Intercept)")
+  
+  # Store selected genes for this fold
+  log_selected_genes_by_fold[[i]] <- selected_genes
+  
+  # Count selected genes
+  log_genes_selected[i] <- length(selected_genes)
 
   # Predict on log scale and back-transform
   pred_log <- predict(log_model, newdata = X_test)
@@ -570,6 +600,36 @@ for (i in seq_along(folds)) {
   log_alphas[i] <- log_model$bestTune$alpha
   log_lambdas[i] <- log_model$bestTune$lambda
 }
+```
+### Gene selectioon
+
+```{r}
+# Calculate gene selection frequency across outer folds
+log_gene_frequency <- sort(
+  table(unlist(log_selected_genes_by_fold)),
+  decreasing = TRUE
+)
+
+# Create gene stability table
+log_gene_stability <- data.frame(
+  Gene = names(log_gene_frequency),
+  Selection_count = as.integer(log_gene_frequency),
+  Selection_frequency = as.numeric(log_gene_frequency) /
+    length(folds)
+)
+
+# Display most frequently selected genes
+head(log_gene_stability, 20)
+
+# Result table 
+
+data.frame(
+  fold = seq_along(folds),
+  alpha = log_alphas,
+  lambda = log_lambdas,
+  genes_available = log_genes_available,
+  genes_selected = log_genes_selected
+)
 ```
 
 #### Compare predictive performance
