@@ -639,6 +639,58 @@ analysis_tpm %>%
 
 ```
 
+#### non-transformed outcome export
+```{r}
+# =========================================================
+# Appendix: Original (untransformed) outcome sensitivity
+# =========================================================
+
+# Create results table
+original_outcome_results <- data.frame(
+  Model = c(
+    "Training-mean baseline",
+    "Gene-expression elastic net"
+  ),
+  RMSE = c(
+    rmse_baseline,
+    rmse_elastic_net
+  ),
+  Standardized_RMSE = c(
+    rmse_baseline / sd(y_vec),
+    rmse_elastic_net / sd(y_vec)
+  ),
+  R2 = c(
+    r2_baseline,
+    r2_elastic_net
+  )
+)
+
+original_outcome_results
+
+# Create editable Word table
+original_table <- flextable::flextable(
+  original_outcome_results
+) %>%
+  flextable::colformat_num(
+    j = c("RMSE", "Standardized_RMSE", "R2"),
+    digits = 3
+  ) %>%
+  flextable::autofit()
+
+# Export
+flextable::save_as_docx(
+  "Appendix Table A3. Untransformed-outcome sensitivity analysis" =
+    original_table,
+  path = here("output", "appendix_original_outcome.docx")
+)
+
+# Also save precise numerical results as CSV
+write.csv(
+  original_outcome_results,
+  here("output", "appendix_original_outcome.csv"),
+  row.names = FALSE
+)
+```
 
 
 ## Log-transformed outcome: comparison of the 4 models
@@ -945,43 +997,41 @@ saveRDS(
 ```
 
 ```{r}
-primary_predictions <- data.frame(
-  observed = y_log,
-  predicted = log_model_predictions[["Gene expression"]]
-)
-
 primary_plot <- ggplot(
   primary_predictions,
   aes(x = observed, y = predicted)
 ) +
   geom_point(
+    size = 2.5,
     color = "black",
-    size = 2.5
+    alpha = 0.8
   ) +
   geom_abline(
     slope = 1,
     intercept = 0,
     linetype = "dashed",
-    color = "black",
-    linewidth = 0.6
+    color = "grey50"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 0.035, 0.005)
+  ) +
+  coord_cartesian(
+    xlim = c(0, 0.035),
+    ylim = c(0.003, 0.009)
   ) +
   labs(
     title = "Elastic Net: Observed vs Predicted",
     subtitle = "Five-fold nested cross-validation",
-    x = "Observed log Day 7 plasmablast frequency",
-    y = "Predicted log Day 7 plasmablast frequency"
+    x = "Observed Day 7 plasmablast frequency",
+    y = "Predicted Day 7 plasmablast frequency"
   ) +
-  theme_minimal(base_size = 13) +
-  theme(
-    panel.grid.major = element_line(color = "grey90"),
-    panel.grid.minor = element_line(color = "grey95")
-  )
+  theme_minimal(base_size = 13)
 
 primary_plot
 
 ggsave(
   here("output", "figure_elastic_net_log_predictions.pdf"),
-  plot = primary_plot,
+  primary_plot,
   width = 7,
   height = 5
 )
