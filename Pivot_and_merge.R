@@ -54,35 +54,31 @@ dim(vaccine_hist)
 # Retain demographic variables and previous vaccination history.
 
 outcome <- participants %>%
-  filter(
-    timepoint == 7,
-    name == "Antibody-secreting_cells_(ASC)"
-  ) %>%
   select(
     participant_id,
     subject,
     biological_sex,
     age,
-    plasmablast_frequency = value,
+    pf_d7 = value_d7,
+    pf_d0 = value_d0,
+    log_pf_d7 = log_value_d7,
+    log_pf_d0 = log_value_d0,
     n_prior_vax
-  ) %>%
-  mutate(
-    transf_plasmablast_frequency = log(plasmablast_frequency)
   )
 
 
 # Check outcome observations
 dim(outcome)
 # 29, 6
-summary(outcome$plasmablast_frequency)
+summary(outcome$pf_d7)
 
 # Confirm each participant has only one outcome measurement
 stopifnot(!anyDuplicated(outcome$participant_id))
 
 # Ensure outcome is numeric and nonmissing
 stopifnot(
-  is.numeric(outcome$plasmablast_frequency),
-  !anyNA(outcome$plasmablast_frequency)
+  is.numeric(outcome$pf_d7),
+  !anyNA(outcome$pf_d7)
 )
 
 # 3. CHECK VACCINATION HISTORY --------------------------------
@@ -244,10 +240,10 @@ rnaseq_tpm_wide <- rnaseq_d0 %>%
 
 # C. Add n_prior_vax and vax_history_available to the RNA-seq count matrix
 
-rnaseq_counts_tmm_wide <- rnaseq_counts_wide %>%
+rnaseq_tmm_wide <- rnaseq_counts_wide %>%
   left_join(
     outcome %>%
-      select(participant_id, n_prior_vax),
+      select(participant_id, n_prior_vax, age, biological_sex),
     by = "participant_id"
   )
 
@@ -257,17 +253,27 @@ dim(rnaseq_counts_wide)
 # 29, 78933
 dim(rnaseq_tpm_wide)
 # 29, 78933
+dim(rnaseq_tmm_wide)
+# 29, 78936
 
 # Each row should represent one participant.
 # Each gene should be a separate column.
 
-gene_cols <- c(2:ncol(rnaseq_counts_tmm_wide)) # columns with gene counts
+gene_cols <- 
+  setdiff(
+    names(rnaseq_counts_wide),
+    "participant_id"
+  ) # getting gene_cols
 
 # Normalizing raw-count matrix with TMM method
 
-dge_tmm <- DGEList(t(rnaseq_counts_tmm_wide[,gene_cols]))
+meta = rnaseq_tmm_wide[,c("participant_id", "n_prior_vax", "age", "biological_sex")]
 
-keep <- filterByExpr(dge_tmm)
+design <- model.matrix(~ n_prior_vax + age + biological_sex, data = meta)
+
+dge_tmm <- DGEList(t(rnaseq_tmm_wide[,gene_cols]))
+
+keep <- filterByExpr(dge_tmm, design = design)
 
 dge_tmm <- dge_tmm[keep, , keep.lib.sizes=FALSE] %>%
   calcNormFactors(method = "TMM")
@@ -276,7 +282,7 @@ counts_log2_cpm_tmm <- cpm(dge_tmm, log = TRUE) %>%
   t() %>%
   as.data.frame()
 
-counts_log2_cpm_tmm$participant_id = rnaseq_counts_wide$participant_id
+counts_log2_cpm_tmm$participant_id = rnaseq_tmm_wide$participant_id
 
 
 # 8. MERGE WITH PARTICIPANT INFORMATION -----------------------
@@ -351,9 +357,15 @@ setdiff(
     "participant_id"
   )
 
+gene_cols_tmm <-
+  setdiff(
+    names(counts_log2_cpm_tmm),
+    "participant_id"
+  )
+
 stopifnot(
   setequal(
-    gene_cols,
+    gene_cols_tmm,
     setdiff(names(counts_log2_cpm_tmm), "participant_id")
   )
 )
@@ -390,13 +402,13 @@ stopifnot(
 # Confirm identical outcome values
 stopifnot(
   identical(
-    analysis_counts$plasmablast_frequency,
-    analysis_tpm$plasmablast_frequency
+    analysis_counts$pf_d7,
+    analysis_tpm$pf_d7
   ),
   identical(
-    analysis_counts$plasmablast_frequency,
-    analysis_tmm$plasmablast_frequency
-  ),
+    analysis_counts$pf_d7,
+    analysis_tmm$pf_d7
+  )
 )
 
 # Report missing gene-expression values
@@ -408,8 +420,8 @@ cat("Missing TPM values:",
     sum(is.na(analysis_tpm[, gene_cols])), "\n")
 # 0
 
-cat("Missing TPM values:",
-    sum(is.na(analysis_tmm[, gene_cols])), "\n")
+cat("Missing TMM values:",
+    sum(is.na(analysis_tmm[, gene_cols_tmm])), "\n")
 # 0
 
 # Missing expression entries are NOT automatically set to zero.
@@ -430,18 +442,18 @@ cat("Genes:",
 
 cat("Raw-count dataset dimensions:",
     dim(analysis_counts), "\n")
-# 29, 78939
+# 29, 78942
 
 cat("TPM dataset dimensions:",
     dim(analysis_tpm), "\n")
-# 29, 78939
+# 29, 78942
 
 cat("TPM dataset dimensions:",
     dim(analysis_tmm), "\n")
-# 29, 78939
+# 29, 78940
 
 # Outcome summary
-summary(analysis_metadata$plasmablast_frequency)
+summary(analysis_metadata$pf_d7)
 
 # Check demographic variables
 analysis_metadata %>%
@@ -451,7 +463,7 @@ analysis_metadata %>%
     biological_sex,
     n_prior_vax,
     vax_history_available,
-    plasmablast_frequency
+    pf_d7
   ) %>%
   head()
 
@@ -476,7 +488,7 @@ saveRDS(
 )
 
 saveRDS(
-  analysis_tpm,
+  analysis_tmm,
   "data/processed/analysis_tmm.rds"
 )
 

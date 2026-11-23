@@ -606,7 +606,6 @@ data.frame(
 )
 ```
 
-
 ## Add vaccine history
 
 ```{r}
@@ -640,6 +639,7 @@ analysis_tpm %>%
 ```
 
 #### non-transformed outcome export
+
 ```{r}
 # =========================================================
 # Appendix: Original (untransformed) outcome sensitivity
@@ -691,7 +691,6 @@ write.csv(
   row.names = FALSE
 )
 ```
-
 
 ## Log-transformed outcome: comparison of the 4 models
 
@@ -865,8 +864,6 @@ stopifnot(
 )
 ```
 
-
-
 ```{r}
 # Calculate RMSE and R2 using log-transformed outcome
 evaluate_log_model <- function(predicted) {
@@ -910,6 +907,7 @@ log_model_tuning
 ```
 
 #### individuals with highest error:
+
 ```{r}
 #### Individuals with highest error
 
@@ -972,7 +970,6 @@ error_df %>%
   select(rank, participant_id, observed_log, predicted_log, squared_error) %>%
   head(10)
 ```
-
 
 ```{r}
 # Export primary model comparison as an editable Word table
