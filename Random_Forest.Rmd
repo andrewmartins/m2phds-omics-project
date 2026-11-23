@@ -13,13 +13,14 @@ knitr::opts_chunk$set(echo = TRUE)
 library("randomForest")
 library("caret")
 library("tidyverse")
+library("here")
 ```
 
 ## Set up 
 
 ```{r}
 # Loading the dataset
-analysis_tpm <- readRDS("analysis_tpm.rds")
+analysis_tpm <- readRDS(here("data", "processed", "analysis_tpm.rds"))
 
 # visualizing dataset
 analysis_tpm[, 1:10] %>%

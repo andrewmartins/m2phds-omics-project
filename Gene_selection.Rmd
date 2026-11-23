@@ -134,8 +134,9 @@ log_gene_stability <- data.frame(
   Gene = names(log_gene_frequency),
   Selection_count = as.integer(log_gene_frequency),
   Selection_frequency = as.numeric(log_gene_frequency) /
-    length(folds)
-)
+    length(folds))
+
+head(log_gene_stability)
 
 # Display most frequently selected genes
 head(log_gene_stability, 20)
@@ -148,7 +149,9 @@ gene_selected_tb <- data.frame(
   genes_available = log_genes_available,
   genes_selected = log_genes_selected )
 ```
-```
+- no gene is selected across all folds
+
+- Inconsistent number of genes selected across folds
 
 
 ## R Markdown
