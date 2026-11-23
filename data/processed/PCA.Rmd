@@ -1,6 +1,6 @@
 ---
 title: "OMICS-PCA"
-author: "K. Sangué Coulibaly"
+author: "Group 2"
 date: "`r Sys.Date()`"
 output: html_document
 ---
@@ -11,15 +11,22 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r}
 library(tidyverse)
+library(ggplot2)
+library(here)
+library(sva)
+```
 
+This step removes all unexpressed gene.
+
+```{r}
 analysis_tpm <- readRDS("analysis_tpm.rds")
 
-# visualizing cleaned data
+# visualizing dataset
 analysis_tpm[, 1:10] %>%
   head(5)
 
 # Creating a vector containing the names of all the gene columns
-gene_columns <- 9:ncol(analysis_tpm)
+gene_columns <- 8:ncol(analysis_tpm)
 
 # convert gene columns to numeric
 analysis_tpm <- analysis_tpm %>%
@@ -32,16 +39,267 @@ gene_totals <- colSums(analysis_tpm[, gene_columns],
 # Verify whether there are genes with total count of zero
 gene_totals[gene_totals == 0]
 
-expressed_genes <- analysis_tpm %>%
-  filter(rowSums(across(-gene_columns))>0)
+expressed_genes <- names(gene_totals[gene_totals > 0])
 
+# Combining expressed genes with demographic characteristics
+filtered_analysis_tpm <- analysis_tpm %>%
+  select(1:8,all_of(expressed_genes))
 
 # Number of genes before filtering
-nrow(analysis_tpm)
+length(gene_columns) 
 
 # Number of genes after filtering
-nrow(expressed_genes)
+length(expressed_genes)
+
+```
+
+# PCA analysis
+
+```{r}
+# PCA only uses numeric values
+
+pca_data <- filtered_analysis_tpm %>%
+  select(all_of(expressed_genes))
+
+# Using the normalized (TPM) values 
+## Expected to do the same with the TMM values
+pca_tpm <- prcomp(pca_data, center = TRUE, scale. = TRUE)
+
+# The proportion of variability explained by each PC
+pc_plot_data <- data.frame(
+  PC = 1:ncol(pca_tpm$x),
+  Variance = summary(pca_tpm)$importance["Proportion of Variance", ] * 100)
+
+pca_plot <- ggplot(pc_plot_data, aes(x = PC, y = Variance)) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_line(color = "steelblue") +
+  labs(
+    title = "PCA Plot",
+    x = "Principal Component",
+    y = "Percentage of Variance Explained"
+  ) +
+  theme_minimal()
+
+ggsave(here("output", "pca_plot.png"), pca_plot, width = 8, height = 6)
+pca_plot
+
+```
+
+Will be using PC1 and PC2 for the inital visaulization
+
+## Exploring PCA by available demographics characteristics
+
+```{r}
+## SEX
+pca_scores$biological_sex <- filtered_analysis_tpm$biological_sex
+
+pca_sex_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = biological_sex)) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA by Sex",
+    x = "PC1",
+    y = "PC2",
+    color = "Sex"
+  ) +
+  theme_minimal()
+
+ggsave(here("output", "pca_sex_plot.png"), pca_sex_plot, width = 8, height = 6)
+pca_sex_plot
+```
+
+```{r}
+## AGE GROUP
+# Categorizing based on the median, Q1 and Q3 (No research)
+
+filtered_analysis_tpm <- filtered_analysis_tpm %>%
+  mutate(Age_group = case_when(
+    age < 53 ~ "Under 53",
+    age >= 53 & age <= 65 ~ "53-65",
+    age >= 65 & age <= 72 ~ "65-72",
+    age >= 72 ~ "72+"
+  ))
+
+pca_scores$Age_group <- filtered_analysis_tpm$Age_group
+
+pca_age_cat_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = Age_group)) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA by Age Group",
+    x = "PC1",
+    y = "PC2",
+    color = "Age_group"
+  ) +
+  theme_minimal() + 
+  ## this part of the code removes the two extreme values to zoom in on the rest of the participants
+  coord_cartesian(
+    xlim = c(-50, 50),
+    ylim = c(-100, 60)
+  )
+
+ggsave(here("output", "pca_age_cat_plot.png"), pca_age_cat_plot, width = 8, height = 6)
+pca_age_cat_plot
+```
+
+```{r}
+## Age as continuous
+pca_scores$age <- filtered_analysis_tpm$age
+
+pca_age_cont_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = age)) +
+  geom_point(size = 3,  alpha = 0.8) +
+  scale_color_gradient(
+    low = "green",
+    high = "red",
+    name = "Age"
+    )+
+  coord_cartesian(xlim = c(-50, 50), ylim = c(-100, 60)) +
+  theme_minimal() +
+  labs(
+    title = "PCA by Age",
+    x = "PC1",
+    y = "PC2"
+  )
+
+ggsave(here("output", "pca_age_cont_plot.png"), pca_age_cont_plot, width = 8, height = 6)
+pca_age_cont_plot
+```
+
+```{r}
+## number of prior vaccination
+
+filtered_analysis_tpm <- filtered_analysis_tpm %>%
+  mutate(vaccines = case_when(
+    n_prior_vax ==0  ~ "Unknown",
+    n_prior_vax >= 0 & n_prior_vax <= 5 ~ "<5",
+    n_prior_vax >= 5 & n_prior_vax <= 10 ~ "5-10",
+    n_prior_vax >= 10 ~ "10+"
+  ))
+
+pca_scores$vaccines <- filtered_analysis_tpm$vaccines
+
+pca_vax_cat_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = vaccines)) +
+  geom_point(size = 3) +
+  labs(
+    title = "PCA by Previous Vaccination",
+    x = "PC1",
+    y = "PC2",
+    color = "Vaccines number"
+  ) +
+  theme_minimal() + 
+  coord_cartesian(
+    xlim = c(-50, 50),
+    ylim = c(-100, 60)
+  )
+
+ggsave(here("output", "pca_vax_cat_plot.png"), pca_vax_cat_plot, width = 8, height = 6)
+pca_vax_cat_plot
+```
+
+```{r}
+## number of prior vaccination (as continuous)
+
+# Create a separate variable for PCA
+filtered_analysis_tpm <- filtered_analysis_tpm %>%
+  mutate(n_prior_vax_pca = na_if(n_prior_vax, 0))
+
+# Add continuous vaccination variable to PCA scores
+pca_scores$n_prior_vax <- filtered_analysis_tpm$n_prior_vax_pca
+
+pca_vax_plot_b <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = n_prior_vax )) +
+  geom_point(size = 3,  alpha = 0.8) +
+  scale_color_gradient(
+    low = "green",
+    high = "red",
+    na.value = "grey",
+    breaks = scales::breaks_pretty(n = 4),
+    labels = scales::label_number(accuracy = 1),
+    name = "Number of previous vaccines"
+    )+
+  coord_cartesian(xlim = c(-50, 50), ylim = c(-100, 60)) +
+  theme_minimal() +
+  labs(
+    title = "PCA by Previous Vaccination",
+    x = "PC1",
+    y = "PC2"
+  )
+
+ggsave(here("output", "pca_vax_plot_b.png"), pca_vax_plot_b, width = 8, height = 6)
+pca_vax_plot_b
 ```
 
 
-## R Markdown
+```{r}
+pca_scores$plasmablast_frequency <- filtered_analysis_tpm$plasmablast_frequency
+
+pca_plasm_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = plasmablast_frequency)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_gradient(
+    low = "green",
+    high = "red",
+    name = "Day 7 Plasmablast frequency"
+  ) +
+  coord_cartesian(xlim = c(-50, 50), ylim = c(-100, 60)) +
+  theme_minimal() +
+  labs(
+    title = "PCA of baseline gene expression",
+    x = "PC1",
+    y = "PC2"
+  )
+
+ggsave(here("output", "pca_plasm_plot.png"), pca_plasm_plot, width = 8, height = 6)
+pca_plasm_plot
+
+```
+
+Most participants clustered relatively close together on all variables. 
+- Participants with higher plasmablast frequencies did not form an obvious separate cluster. There was no obvious gradient in plasmablast frequency across PC1 and PC2.
+- participants with higher number of previosu vaccination did form a gradient across PC1 and PC2. 
+
+------------------------------------------------------------------------
+
+# Further analysis
+
+```{r}
+## investigate PC association with Day 7 plasmablast frequency
+
+cor.test(
+  pca_scores$PC1,
+  pca_scores$plasmablast_frequency,
+  method = "spearman",
+  use = "complete.obs"
+)
+
+# PC2 correlation
+cor.test(
+  pca_scores$PC2,
+  pca_scores$plasmablast_frequency,
+  method = "spearman",
+  use = "complete.obs"
+)
+```
+
+## PCA loadings
+
+Which genes contribute most to overall variation?
+  
+```{r}
+## Genes contributing most to PC1 and PC2
+## Can be used for enrichment (with DAVID)
+
+loadings <- as.data.frame(pca_tpm$rotation)
+loadings$Gene_ID <- rownames(loadings)
+
+top_PC1 <- loadings %>%
+  arrange(desc(abs(PC1))) %>%
+  select(PC1) %>%
+  head(10)
+
+top_PC1
+
+
+top_PC2 <- loadings %>%
+  arrange(desc(abs(PC2))) %>%
+  select(PC2) %>%
+  head(10)
+
+top_PC2
+```
