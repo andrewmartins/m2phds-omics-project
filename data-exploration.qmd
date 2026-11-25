@@ -10,28 +10,48 @@ library(lme4)
 library(broom.mixed)
 participants = read.csv(here::here("data","participants.csv"))
 
+participants
+
 vaccine_hist = read.csv(here::here("data", "participant_vaccineHistory.csv"))
 vaccine_hist
 
 flow_outcome = read.csv(here::here("data","publicData_ex_vivo_flow.csv"))
 
-flow_wide <- flow_outcome %>%
-  filter(name == "Antibody-secreting_cells_(ASC)") %>%
+flow_outcome %>%
+  group_by(name) %>%
+  summarise(
+    n_by_name = n()
+  )
+
+flow_outcome %>%
   mutate(timepoint = ifelse(timepoint == "Pre-vacc", "0", as.character(timepoint))) %>%
+  filter(timepoint == "0", participant_id %in% participants$participant_id) %>%
+  distinct(participant_id, name) %>%
+  count(name, sort = TRUE)
+
+flow_wide <- flow_outcome %>%
+  filter(name %in% c("Antibody-secreting_cells_(ASC)", "B_cells")) %>%
+  mutate(
+    timepoint = ifelse(timepoint == "Pre-vacc", "0", as.character(timepoint)),
+    cell = recode(name,
+                  "Antibody-secreting_cells_(ASC)" = "asc",
+                  "B_cells" = "bcell")
+    ) %>%
   filter(timepoint %in% c("0", "7")) %>%
-  distinct(subject, timepoint, .keep_all = TRUE) %>%       # drop the duplicate baselines
-  select(participant_id, timepoint, value, comments) %>%
+  distinct(subject, cell, timepoint, .keep_all = TRUE) %>%       # drop the duplicate baselines
+  select(participant_id, cell, timepoint, value, comments) %>%
   pivot_wider(
     id_cols     = participant_id,
-    names_from  = timepoint,
+    names_from  = c(cell, timepoint),
     values_from = c(value, comments),
-    names_glue  = "{.value}_d{timepoint}"
+    names_glue  = "{.value}_{cell}_d{timepoint}"
   ) %>%
-  filter(!is.na(value_d7)) %>%
-  rename(round_d0 = comments_d0, round_d7 = comments_d7) %>%
+  filter(!is.na(value_asc_d7)) %>%
+  rename(round_d0 = comments_asc_d0, round_d7 = comments_asc_d7) %>%
   mutate(
-    log_value_d0 = log10(value_d0),
-    log_value_d7 = log10(value_d7)
+    across(
+      starts_with("value_"), log, .names = "log_{.col}"
+    )
   )
 
 flow_wide
@@ -54,6 +74,69 @@ participants_vax
 
 nrow(participants_cleaned)                       # expect 29
 anyDuplicated(participants_cleaned$participant_id)   # expect 0
+
+
+pb_d0_log <- participants$log_value_asc_d0
+dat_lobo <- participants %>%
+  select(participant_id, log_value_asc_d7, log_value_asc_d0, round_d7)
+
+y_log     <- dat_lobo$log_value_asc_d7
+pb_d0_log <- dat_lobo$log_value_asc_d0
+rounds    <- unique(dat_lobo$round_d7)
+test_idx <- which(dat_lobo$round_d7 == r)
+
+lobo_pred <- rep(NA_real_, length(y_log))
+lobo_base <- rep(NA_real_, length(y_log))
+
+for (r in rounds) {
+  test_idx <- which(participants$round_d7 == r)
+  train <- data.frame(y = y_log[-test_idx], pb0 = pb_d0_log[-test_idx])
+  test  <- data.frame(pb0 = pb_d0_log[test_idx])
+
+  med <- median(train$pb0, na.rm = TRUE)          # impute within fold
+  train$pb0[is.na(train$pb0)] <- med
+  test$pb0[is.na(test$pb0)]   <- med
+
+  lobo_pred[test_idx] <- predict(lm(y ~ pb0, data = train), newdata = test)
+  lobo_base[test_idx] <- mean(train$y)
+}
+
+sqrt(mean((y_log - lobo_base)^2))   # baseline RMSE
+sqrt(mean((y_log - lobo_pred)^2))   # day-0 ASC RMSE
+
+
+
+
+day0 <- flow_outcome %>%
+  mutate(timepoint = ifelse(timepoint == "Pre-vacc", "0", as.character(timepoint))) %>%
+  filter(timepoint == "0",
+         participant_id %in% participants$participant_id,
+         value > 0) %>%
+  distinct(participant_id, name, .keep_all = TRUE)
+
+# Round effect per population (Kruskal-Wallis on log values)
+round_tests <- day0 %>%
+  group_by(name) %>%
+  filter(n_distinct(comments) > 1, n() >= 15) %>%
+  summarise(p = kruskal.test(log(value) ~ factor(comments))$p.value,
+            n = n(), .groups = "drop") %>%
+  arrange(p)
+round_tests
+
+# Heatmap of median log-frequency by round, scaled within each population
+day0 %>%
+  group_by(name, comments) %>%
+  summarise(med = median(log(value)), .groups = "drop") %>%
+  group_by(name) %>%
+  mutate(z = (med - mean(med)) / sd(med)) %>%
+  ggplot(aes(comments, name, fill = z)) +
+  geom_tile() +
+  scale_fill_gradient2() +
+  labs(x = "Experimental round", y = NULL, fill = "Scaled median")
+```
+
+```{r}
+vaccine_history = 
 ```
 
 ```{r}
@@ -154,7 +237,8 @@ participants = left_join(flow_outcome_7, flow_outcome_0, by = "participant_id", 
   left_join(flow_outcome_pre_vacc, by = "participant_id")
 
 participants
-cor.test(participants$log_value_d0,participants$log_value_d7)
+cor.test(participants$log_value_asc_d7,participants$log_value_bcell_d0)
+cor.test(participants$log_value_asc_d0,participants$log_value_asc_d7)
 ```
 
 ```{r}

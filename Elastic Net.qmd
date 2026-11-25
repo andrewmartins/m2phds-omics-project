@@ -28,7 +28,7 @@ dim(analysis_tpm)
 
 ```{r}
 # Outcome: Day 7 plasmablast frequency
-y_vec <- analysis_tpm$pf_d7
+y_vec <- analysis_tpm$plasmablast_frequency
 
 # Identify gene columns using their Ensembl IDs
 gene_cols <- grep(
@@ -511,20 +511,25 @@ log_predictions <- rep(NA_real_, length(y_vec))
 log_alphas <- rep(NA_real_, length(folds))
 log_lambdas <- rep(NA_real_, length(folds))
 # Wider lambda grid for the log-transformed outcome
+# log_elastic_net_grid <- expand.grid(
+#   alpha = c(0, 0.25, 0.5, 0.75, 1),
+#   lambda = c(
+#     0.000001,
+#     0.00001,
+#     0.0001,
+#     0.001,
+#     0.01,
+#     0.05,
+#     0.1,
+#     0.2,
+#     0.5,
+#     1
+#   )
+# )
+
 log_elastic_net_grid <- expand.grid(
-  alpha = c(0, 0.25, 0.5, 0.75, 1),
-  lambda = c(
-    0.000001,
-    0.00001,
-    0.0001,
-    0.001,
-    0.01,
-    0.05,
-    0.1,
-    0.2,
-    0.5,
-    1
-  )
+  alpha  = c(0, 0.25, 0.5, 0.75, 1),
+  lambda = 10^seq(-3, 4, length.out = 30)   # 0.001 to 10,000
 )
 
 for (i in seq_along(folds)) {
@@ -779,21 +784,27 @@ for (model_name in names(log_models)) {
     y_train <- y_log[-test_idx]
 
     # Add vaccination history only for the third model
-    if (model_name ==
-        "Genes + age + sex + vaccination history") {
-
+    if (model_name == "Genes + age + sex + vaccination history") {
       # Keep missing values as NA
       # caret will impute them within each inner training fold
-      X_train <- cbind(
-        X_train,
-      n_prior_vax = vax_count[-test_idx]
-    )
-          X_test <- cbind(
-        X_test,
-        n_prior_vax = vax_count[test_idx]
-      )
+      
+      median_impute <- function(X_train, X_test) {
+        na_cols <- which(colSums(is.na(X_train)) > 0 | colSums(is.na(X_test)) > 0)
+      
+        for (j in na_cols) {
+          med <- median(X_train[, j], na.rm = TRUE)
+          X_train[is.na(X_train[, j]), j] <- med
+          X_test[is.na(X_test[, j]), j]   <- med
+        }
+      
+        list(train = X_train, test = X_test)
+      }
     }
-
+    
+    imp     <- median_impute(X_train, X_test)
+    X_train <- imp$train
+    X_test  <- imp$test
+    
 
         # Identify nonzero-variance predictors using outer training data
     # na.rm = TRUE allows the vaccination variable to contain NA
@@ -813,7 +824,7 @@ for (model_name in names(log_models)) {
     if (model_name ==
         "Genes + age + sex + vaccination history") {
     
-      preprocessing <- c("medianImpute", "zv", "center", "scale")
+      preprocessing <- c("zv", "center", "scale")
     
     } else {
     
@@ -889,6 +900,9 @@ log_model_results <- data.frame(
 )
 
 log_model_results
+
+table(log_model_tuning[["Gene expression"]]$Lambda)
+table(log_model_tuning[["Gene expression"]]$Alpha)
 ```
 
 ```{r}
@@ -1193,7 +1207,8 @@ loocv_predictions <- list(
   "Training-mean baseline" = rep(NA_real_, n),
   "Gene expression" = rep(NA_real_, n),
   "Genes + age + sex" = rep(NA_real_, n),
-  "Genes + age + sex + vaccination history" = rep(NA_real_, n)
+  "Genes + age + sex + vaccination history" = rep(NA_real_, n),
+  "PCA regression (5 PCs)" = rep(NA_real_, n)
 )
 
 # Store elastic net tuning parameters
@@ -1273,7 +1288,7 @@ if (model_name ==
     # 
     # } else {
     # 
-      preprocessing <- c("zv", "center", "scale")
+    #  preprocessing <- c("zv", "center", "scale")
     # }
 
     # Inner five-fold cross-validation
@@ -1297,8 +1312,9 @@ if (model_name ==
         summaryFunction = rmse_only
       ),
       metric = "RMSE",
-      preProcess = preprocessing,
-      standardize = FALSE
+      #preProcess = preprocessing,
+      standardize = TRUE, #FALSE
+      #penalty.factor = pf
     )
 
     # Predict held-out participant on log scale
@@ -1311,6 +1327,27 @@ if (model_name ==
 
   loocv_tuning[[model_name]] <- tuning
 }
+
+
+# ---- PCA regression (not elastic net) ----
+pcr_pred <- rep(NA_real_, n)
+n_pc <- 5
+
+for (i in seq_len(n)) {
+  pca_tr <- prcomp(X_mat[-i, , drop = FALSE], center = TRUE, scale. = TRUE)
+
+  tr <- data.frame(y = y_log[-i], pca_tr$x[, 1:n_pc])
+  te <- data.frame(predict(pca_tr, newdata = X_mat[i, , drop = FALSE])[, 1:n_pc, drop = FALSE])
+
+  pcr_pred[i] <- predict(lm(y ~ ., data = tr), newdata = te)
+}
+
+loocv_predictions[["PCA regression (5 PCs)"]] <- pcr_pred
+
+# ---- existing check ----
+stopifnot(
+  all(sapply(loocv_predictions, function(x) !anyNA(x)))
+)
 
 # Confirm all predictions are available
 stopifnot(

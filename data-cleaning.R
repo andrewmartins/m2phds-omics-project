@@ -33,7 +33,8 @@ flow_outcome = flow_outcome%>%
     across(
       starts_with("value_"), log, .names = "log_{.col}"
     )
-  )
+  ) %>%
+  rename(value_d7 = plasmablast_frequency)
   
 
 flow_outcome

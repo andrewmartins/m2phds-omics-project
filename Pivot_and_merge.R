@@ -269,11 +269,11 @@ gene_cols <-
 
 meta = rnaseq_tmm_wide[,c("participant_id", "n_prior_vax", "age", "biological_sex")]
 
-design <- model.matrix(~ n_prior_vax + age + biological_sex, data = meta)
+#design <- model.matrix(~ n_prior_vax + age + biological_sex, data = meta)
 
 dge_tmm <- DGEList(t(rnaseq_tmm_wide[,gene_cols]))
 
-keep <- filterByExpr(dge_tmm, design = design)
+keep <- filterByExpr(dge_tmm)#, design = design)
 
 dge_tmm <- dge_tmm[keep, , keep.lib.sizes=FALSE] %>%
   calcNormFactors(method = "TMM")

@@ -15,6 +15,8 @@ library(here)
 library(ggplot2)
 library(flextable)
 library(glmnet)
+library(tmod)
+library(GSVA)
 
 
 # Load the merged TPM dataset
@@ -22,6 +24,8 @@ analysis_tmm <- readRDS(here("data", "processed", "analysis_tmm.rds"))
 
 # Check dimensions
 dim(analysis_tmm)
+
+analysis_tmm
 
 ```
 
@@ -355,7 +359,7 @@ for (i in seq_along(folds)) {
       summaryFunction = rmse_only
     ),
     metric = "RMSE",
-    preProcess = c("zv", "center", "scale"),
+    #preProcess = c("zv", "center", "scale"),
     standardize = FALSE,
     penalty.factor = pf
   )
@@ -510,20 +514,10 @@ log_predictions <- rep(NA_real_, length(y_vec))
 log_alphas <- rep(NA_real_, length(folds))
 log_lambdas <- rep(NA_real_, length(folds))
 # Wider lambda grid for the log-transformed outcome
+
 log_elastic_net_grid <- expand.grid(
-  alpha = c(0, 0.25, 0.5, 0.75, 1),
-  lambda = c(
-    0.000001,
-    0.00001,
-    0.0001,
-    0.001,
-    0.01,
-    0.05,
-    0.1,
-    0.2,
-    0.5,
-    1
-  )
+  alpha  = c(0, 0.25, 0.5, 0.75, 1),
+  lambda = 10^seq(-3, 4, length.out = 30)   # 0.001 to 10,000
 )
 
 for (i in seq_along(folds)) {
@@ -725,11 +719,6 @@ X_log_demographic <- X_combined
 #   )
 # )
 
-log_elastic_net_grid <- expand.grid(
-  alpha  = c(0, 0.25, 0.5, 0.75, 1),
-  lambda = 10^seq(-3, 4, length.out = 30)   # 0.001 to 10,000
-)
-
 # Define model predictor sets
 log_models <- list(
   "Gene expression" = X_mat,
@@ -794,7 +783,7 @@ for (model_name in names(log_models)) {
         X_train,
       n_prior_vax = vax_count[-test_idx]
     )
-          X_test <- cbind(
+        X_test <- cbind(
         X_test,
         n_prior_vax = vax_count[test_idx]
       )
@@ -803,28 +792,28 @@ for (model_name in names(log_models)) {
 
         # Identify nonzero-variance predictors using outer training data
     # na.rm = TRUE allows the vaccination variable to contain NA
-    keep_predictors <- apply(
-      X_train,
-      2,
-      function(x) {
-        v <- var(x, na.rm = TRUE)
-        is.finite(v) && v > 0
-      }
-    )
+    # keep_predictors <- apply(
+    #   X_train,
+    #   2,
+    #   function(x) {
+    #     v <- var(x, na.rm = TRUE)
+    #     is.finite(v) && v > 0
+    #   }
+    # )
     
-    X_train <- X_train[, keep_predictors, drop = FALSE]
-    X_test <- X_test[, keep_predictors, drop = FALSE]
-    
+    # X_train <- X_train[, keep_predictors, drop = FALSE]
+    # X_test <- X_test[, keep_predictors, drop = FALSE]
+    # 
     # Median imputation is required only for the vaccination model
-    if (model_name ==
-        "Genes + age + sex + vaccination history") {
-    
-      preprocessing <- c("medianImpute", "zv", "center", "scale")
-    
-    } else {
-    
+    # if (model_name ==
+    #     "Genes + age + sex + vaccination history") {
+    # 
+    #   preprocessing <- c("zv", "center", "scale")
+    # 
+    # } else {
+    # 
       preprocessing <- c("zv", "center", "scale")
-    }
+    # }
 
     # Use the same inner CV splits for each model
     set.seed(1000 + i)
@@ -1201,9 +1190,9 @@ loocv_predictions <- list(
   "Training-mean baseline" = rep(NA_real_, n),
   "Gene expression" = rep(NA_real_, n),
   "Genes + age + sex" = rep(NA_real_, n),
-  "Genes + age + sex + vaccination history" = rep(NA_real_, n),
-  "Genes + age + sex + day 0 plasmablast frequency" = rep(NA_real_, n),
-  "Genes + age + sex + vaccination history + day 0 plasmablast frequency" = rep(NA_real_, n)
+  "Genes + age + sex + vaccination history" = rep(NA_real_, n)
+  #"Genes + age + sex + day 0 plasmablast frequency" = rep(NA_real_, n),
+  #"Genes + age + sex + vaccination history + day 0 plasmablast frequency" = rep(NA_real_, n)
 )
 
 # Store elastic net tuning parameters
@@ -1213,9 +1202,9 @@ loocv_tuning <- list()
 loocv_models <- list(
   "Gene expression" = X_mat,
   "Genes + age + sex" = X_combined,
-  "Genes + age + sex + vaccination history" = X_combined,
-  "Genes + age + sex + day 0 plasmablast frequency" = X_combined,
-  "Genes + age + sex + vaccination history + day 0 plasmablast frequency" = X_combined
+  "Genes + age + sex + vaccination history" = X_combined
+  #"Genes + age + sex + day 0 plasmablast frequency" = X_combined,
+  #"Genes + age + sex + vaccination history + day 0 plasmablast frequency" = X_combined
 )
 
 for (model_name in names(loocv_models)) {
@@ -1266,62 +1255,46 @@ for (model_name in names(loocv_models)) {
         n_prior_vax = vax_count[test_idx]
       )
     }
-    
-    else if (model_name ==
-        "Genes + age + sex + day 0 plasmablast frequency") {
-      
-      covars <- c("age", "biological_sexMale", "log_pf_d0")
-    
-      # Keep missing values as NA
-      # caret will impute them within each inner training fold
-      X_train <- cbind(
-        X_train,
-        log_pf_d0 = log_pf_d0[-test_idx]
-      )
-      
-      X_test <- cbind(
-        X_test,
-        log_pf_d0 = log_pf_d0[test_idx]
-      )
-    }
-    
-    else if (model_name ==
-        "Genes + age + sex + vaccination history + day 0 plasmablast frequency") {
-      
-      covars <- c("age", "biological_sexMale", "n_prior_vax", "log_pf_d0")
-    
-      # Keep missing values as NA
-      # caret will impute them within each inner training fold
-      X_train <- cbind(
-        X_train,
-        n_prior_vax = vax_count[-test_idx],
-        log_pf_d0 = log_pf_d0[-test_idx]
-      )
-      
-      X_test <- cbind(
-        X_test,
-        n_prior_vax = vax_count[test_idx],
-        log_pf_d0 = log_pf_d0[test_idx]
-      )
-    }
-
-    # Identify nonzero-variance predictors using outer training data
-    # na.rm = TRUE allows the vaccination variable to contain NA
-    
-    # Median imputation is required only for the vaccination model
-    # if (model_name %in% 
-    #     c("Genes + age + sex + vaccination history",
-    #       "Genes + age + sex + day 0 plasmablast frequency",
-    #       "Genes + age + sex + vaccination history + day 0 plasmablast frequency")
-    #     ){
-    #   preprocessing <- "medianImpute"
     # 
-    # } else {
+    # else if (model_name ==
+    #     "Genes + age + sex + day 0 plasmablast frequency") {
+    #   
+    #   covars <- c("age", "biological_sexMale", "log_pf_d0")
     # 
-    #   preprocessing <- NULL
+    #   # Keep missing values as NA
+    #   # caret will impute them within each inner training fold
+    #   X_train <- cbind(
+    #     X_train,
+    #     log_pf_d0 = log_pf_d0[-test_idx]
+    #   )
+    #   
+    #   X_test <- cbind(
+    #     X_test,
+    #     log_pf_d0 = log_pf_d0[test_idx]
+    #   )
+    # }
+    # 
+    # else if (model_name ==
+    #     "Genes + age + sex + vaccination history + day 0 plasmablast frequency") {
+    #   
+    #   covars <- c("age", "biological_sexMale", "n_prior_vax", "log_pf_d0")
+    # 
+    #   # Keep missing values as NA
+    #   # caret will impute them within each inner training fold
+    #   X_train <- cbind(
+    #     X_train,
+    #     n_prior_vax = vax_count[-test_idx],
+    #     log_pf_d0 = log_pf_d0[-test_idx]
+    #   )
+    #   
+    #   X_test <- cbind(
+    #     X_test,
+    #     n_prior_vax = vax_count[test_idx],
+    #     log_pf_d0 = log_pf_d0[test_idx]
+    #   )
     # }
     
-    pf <- ifelse(colnames(X_train) %in% covars, 0, 1)
+    #pf <- ifelse(colnames(X_train) %in% covars, 0, 1)
 
 
     # Inner five-fold cross-validation
@@ -1345,9 +1318,9 @@ for (model_name in names(loocv_models)) {
         summaryFunction = rmse_only
       ),
       metric = "RMSE",
-      # preProcess = preprocessing,
-      standardize = TRUE,
-      penalty.factor = pf
+      preProcess = c("zv", "center", "scale"),
+      standardize = FALSE
+      #penalty.factor = pf
     )
 
     # Predict held-out participant on log scale
@@ -1533,6 +1506,8 @@ expression_diagnostics <- data.frame(
 expression_diagnostics %>%
   arrange(desc(loocv_error)) %>%
   head(10)
+
+275/340
 ```
 
 ##### hyper parameters
@@ -1557,6 +1532,6 @@ cv_table <- flextable(cv_comparison) %>%
 
 save_as_docx(
   "Sensitivity analysis: Cross-validation strategy" = cv_table,
-  path = here("output", "sensitivity_loocv.docx")
+  path = here("output", "sensitivity_loocv_tmm.docx")
 )
 ```
