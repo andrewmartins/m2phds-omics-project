@@ -28,7 +28,7 @@ dim(analysis_tpm)
 
 ```{r}
 # outcome = Day 7 plasmablast frequency
-y_vec <- analysis_tpm$plasmablast_frequency
+y_vec <- analysis_tpm$pf_d7
 
 # Identify gene columns 
 gene_cols <- grep(
