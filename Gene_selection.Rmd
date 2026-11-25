@@ -1,0 +1,158 @@
+---
+title: "Gene_selection"
+author: "Group 2"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# USING THE CODE FROM ELASTIC NET 
+
+The goal is to get a list of selected genes after running elastic net to use in random forest. 
+
+```{r}
+# Loading the dataset
+analysis_tpm <- readRDS(here("data", "processed", "analysis_tpm.rds"))
+
+# visualizing dataset
+analysis_tpm[, 1:10] %>%
+  head(5)
+
+# outcome = Day 7 plasmablast frequency
+y_vec <- analysis_tpm$pf_d7
+
+# Log-transform Day 7 plasmablast frequency
+y_log <- log(y_vec)
+
+# Store predictions and selected hyperparameters
+log_predictions <- rep(NA_real_, length(y_vec))
+log_alphas <- rep(NA_real_, length(folds))
+log_lambdas <- rep(NA_real_, length(folds))
+
+# Wider lambda grid for the log-transformed outcome
+log_elastic_net_grid <- expand.grid(
+  alpha = c(0, 0.25, 0.5, 0.75, 1),
+  lambda = c(
+    0.000001,
+    0.00001,
+    0.0001,
+    0.001,
+    0.01,
+    0.05,
+    0.1,
+    0.2,
+    0.5,
+    1
+  )
+)
+
+## Recording genes to use in RF
+log_genes_available <- rep(NA_integer_, length(folds))
+log_genes_selected <- rep(NA_integer_, length(folds))
+
+# Store selected genes for each outer fold
+log_selected_genes_by_fold <- vector("list", length(folds))
+
+for (i in seq_along(folds)) {
+  cat("Running log-transformed model - outer fold", i, "\n")
+
+  test_idx <- folds[[i]]
+
+  # Split expression data
+  X_train <- X_mat[-test_idx, , drop = FALSE]
+  X_test <- X_mat[test_idx, , drop = FALSE]
+
+  # Use log-transformed outcome
+  y_train <- y_log[-test_idx]
+
+  # Remove zero-variance genes using training data only
+  keep_genes <- apply(X_train, 2, var) > 0
+
+  X_train <- X_train[, keep_genes, drop = FALSE]
+  X_test <- X_test[, keep_genes, drop = FALSE]
+
+  # Fit elastic net with inner 5-fold CV
+  log_model <- caret::train(
+    x = X_train,
+    y = y_train,
+    method = "glmnet",
+    tuneGrid = log_elastic_net_grid,
+    trControl = trainControl(
+      method = "cv",
+      number = 5,
+      summaryFunction = rmse_only
+    ),
+    metric = "RMSE",
+    preProcess = c("zv", "center", "scale"),
+    standardize = FALSE
+  )
+  
+  # Number of genes available after variance filtering
+  log_genes_available[i] <- ncol(X_train)
+  
+  # Extract coefficients at selected lambda
+  selected_coefs <- coef(
+    log_model$finalModel,
+    s = log_model$bestTune$lambda
+  )
+  
+  # Identify genes with nonzero coefficients
+  selected_genes <- rownames(selected_coefs)[
+    as.vector(selected_coefs != 0)
+  ]
+  
+  # Remove intercept
+  selected_genes <- setdiff(selected_genes, "(Intercept)")
+  
+  # Store selected genes for this fold
+  log_selected_genes_by_fold[[i]] <- selected_genes
+  
+  # Count selected genes
+  log_genes_selected[i] <- length(selected_genes)
+
+  # Predict on log scale and back-transform
+  pred_log <- predict(log_model, newdata = X_test)
+
+  log_predictions[test_idx] <- exp(pred_log)
+
+  # Save selected parameters
+  log_alphas[i] <- log_model$bestTune$alpha
+  log_lambdas[i] <- log_model$bestTune$lambda
+}
+
+# Calculate gene selection frequency across outer folds
+log_gene_frequency <- sort(
+  table(unlist(log_selected_genes_by_fold)),
+  decreasing = TRUE
+)
+
+# Create gene stability table
+log_gene_stability <- data.frame(
+  Gene = names(log_gene_frequency),
+  Selection_count = as.integer(log_gene_frequency),
+  Selection_frequency = as.numeric(log_gene_frequency) /
+    length(folds))
+
+head(log_gene_stability)
+
+# Display most frequently selected genes
+head(log_gene_stability, 20)
+
+# Result table 
+gene_selected_tb <- data.frame(
+  fold = seq_along(folds),
+  alpha = log_alphas,
+  lambda = log_lambdas,
+  genes_available = log_genes_available,
+  genes_selected = log_genes_selected )
+```
+- no gene is selected across all folds
+
+- Inconsistent number of genes selected across folds
+
+
+## R Markdown
+

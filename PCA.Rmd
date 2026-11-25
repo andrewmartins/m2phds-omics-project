@@ -19,7 +19,7 @@ library(sva)
 This step removes all unexpressed gene.
 
 ```{r}
-analysis_tpm <- readRDS("analysis_tpm.rds")
+analysis_tpm <- readRDS(here("data", "processed", "analysis_tpm.rds"))
 
 # visualizing dataset
 analysis_tpm[, 1:10] %>%

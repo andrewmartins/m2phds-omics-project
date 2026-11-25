@@ -1,6 +1,6 @@
 ---
 title: "Elastic Net"
-author: "Group 2"
+author: "Group 2 - Genevieve"
 format: html
 editor: source
 ---
@@ -27,10 +27,15 @@ dim(analysis_tpm)
 ### Separate the outcome and predictors
 
 ```{r}
+<<<<<<< HEAD
 # Outcome: Day 7 plasmablast frequency
 y_vec <- analysis_tpm$plasmablast_frequency
+=======
+# outcome = Day 7 plasmablast frequency
+y_vec <- analysis_tpm$pf_d7
+>>>>>>> e184143b89ab65c445807889d86194a71c9af2f8
 
-# Identify gene columns using their Ensembl IDs
+# Identify gene columns 
 gene_cols <- grep(
   "^ENSG",
   names(analysis_tpm),
@@ -44,11 +49,11 @@ X_mat <- as.matrix(analysis_tpm[, gene_cols])
 X_mat <- log2(X_mat + 1)
 
 
-# Primary outcome: natural-log-transformed plasmablast frequency
+# Primary outcome = natural-log-transformed plasmablast frequency
 stopifnot(all(y_vec > 0))
-y_log <- analysis_tpm$log_pf_d7
+y_log <- log(y_vec)
 
-# Verify dimensions
+# check dimensions
 dim(X_mat)
 length(y_vec)
 ```
@@ -122,17 +127,13 @@ sapply(folds, length)
 
 **Inner cross-validation:** In each outer training set, we use another five-fold cross-validation procedure to select the optimal α and λ
 
-### Fit elastic net using nested cross-validation
+### Fit elastic net using nested cross-validation (not transformed)
 
 ```{r}
 
-# =========================================================
 # Nested cross-validation: elastic net
-# =========================================================
 
-# Use the tuning grid and outer folds created previously.
-# Replace the earlier lambda grid with values more appropriate
-# for the small numerical scale of plasmablast frequency.
+# Using the tuning grid and outer folds created above
 
 elastic_net_grid <- expand.grid(
   alpha = c(0, 0.25, 0.5, 0.75, 1),
@@ -219,7 +220,7 @@ stopifnot(
 
 ```
 
-#### Evaluate elastic net
+#### Evaluate elastic net (not transformed)
 
 ```{r}
 
@@ -242,14 +243,14 @@ r2_baseline <- 1 -
   sum((y_vec - baseline_predictions)^2) /
   sum((y_vec - mean(y_vec))^2)
 
-# Display results
+# show results
 data.frame(
   model = c("Elastic net", "Training-mean baseline"),
   RMSE = c(rmse_elastic_net, rmse_baseline),
   R2 = c(r2_elastic_net, r2_baseline)
 )
 
-# Inspect selected hyperparameters and retained genes
+# look at selected hyperparameters and retained genes
 data.frame(
   fold = seq_along(folds),
   alpha = best_alphas,
@@ -273,13 +274,11 @@ R^2^ = 1 is perfect prediction, R^2^ = 0 means predictions are as good as the ov
 
 ### Additional analyses
 
-## Combined elastic net model with baseline gene expression + age + sex
+## Combined elastic net model with baseline gene expression + age + sex (not transformed outcome)
 
 ```{r}
 
-# =========================================================
 # Combined elastic net: gene expression + demographics
-# =========================================================
 
 # Create numeric demographic predictors
 # model.matrix() converts biological_sex into a dummy variable
@@ -309,7 +308,7 @@ stopifnot(
 
 ```
 
-### Fit the combined elastic net
+### Fit the combined elastic net (not transformed outcome)
 
 ```{r}
 
@@ -379,7 +378,7 @@ stopifnot(
 
 ```
 
-### RMSE and R\^2
+### RMSE and R\^2 (non-transformed outcome)
 
 ```{r}
 
@@ -429,7 +428,7 @@ The gene-expression-only model performed best, although its advantage over the m
 
 The combined model performed worse than both gene expression alone and the mean-only baseline.
 
-### Sensitivity analysis: Log-transforming the outcome
+### Sensitivity analysis: Log-transforming the outcome (considered main analysis in write-up)
 
 ```{r}
 # Log-transform Day 7 plasmablast frequency
@@ -438,9 +437,7 @@ y_log <- log(y_vec)
 # Create output folder if needed
 dir.create("output", showWarnings = FALSE)
 
-# -----------------------------------------
 # 1. Side-by-side comparison
-# -----------------------------------------
 
 pdf(
   "output/plasmablast_transformation_comparison.pdf",
@@ -468,9 +465,7 @@ hist(
 
 dev.off()
 
-# -----------------------------------------
 # 2. Log-transformed distribution only
-# -----------------------------------------
 
 pdf(
   "output/plasmablast_log_transformed.pdf",
@@ -611,7 +606,8 @@ data.frame(
 )
 ```
 
-## Add vaccine history
+
+## Add vaccine history (prep the vaccine history variable for use)
 
 ```{r}
 # Load vaccination history
@@ -643,12 +639,9 @@ analysis_tpm %>%
 
 ```
 
-#### non-transformed outcome export
-
+#### non-transformed outcome export (add in export for the non-transformed elastic nets above for appendix)
 ```{r}
-# =========================================================
-# Appendix: Original (untransformed) outcome sensitivity
-# =========================================================
+# Appendix figure = Original (untransformed) outcome sensitivity
 
 # Create results table
 original_outcome_results <- data.frame(
@@ -697,12 +690,11 @@ write.csv(
 )
 ```
 
-## Log-transformed outcome: comparison of the 4 models
+
+## Log-transformed outcome, run one chunk to compare all of the 4 models (baseline, gene expression, genes + age + sex, genes + age + sex + vaccines)
 
 ```{r}
-# =========================================================
 # Log-transformed outcome: comparison of four models
-# =========================================================
 
 # Outcome
 stopifnot(all(y_vec > 0))
@@ -724,7 +716,8 @@ log_elastic_net_grid <- expand.grid(
   lambda = c(
     0.000001, 0.00001, 0.0001,
     0.001, 0.01, 0.05,
-    0.1, 0.2, 0.5, 1
+    0.1, 0.2, 0.5, 1,
+    2, 5, 10, 20
   )
 )
 
@@ -875,6 +868,8 @@ stopifnot(
 )
 ```
 
+
+
 ```{r}
 # Calculate RMSE and R2 using log-transformed outcome
 evaluate_log_model <- function(predicted) {
@@ -920,8 +915,7 @@ log_model_results
 log_model_tuning
 ```
 
-#### individuals with highest error:
-
+#### individuals with highest error analysis:
 ```{r}
 #### Individuals with highest error
 
@@ -979,11 +973,12 @@ ggsave(
   dpi = 300
 )
 
-# Optional: show the top 10 contributors in table form
+# show the top 10 contributors in table form
 error_df %>%
   select(rank, participant_id, observed_log, predicted_log, squared_error) %>%
   head(10)
 ```
+#### Export table of the log-transformed models for the write-up
 
 ```{r}
 # Export primary model comparison as an editable Word table
@@ -1006,6 +1001,8 @@ saveRDS(
 )
 
 ```
+
+#### Export plot of log-transformed model for the write-up
 
 ```{r}
 primary_plot <- ggplot(
@@ -1195,10 +1192,9 @@ save_as_docx(
 ## Leave-one-out cross validation analysis
 
 ```{r}
-# =========================================================
 # Sensitivity analysis: Nested LOOCV
 # Log-transformed outcome, n = 29
-# =========================================================
+# median imputation
 
 n <- length(y_log)
 
@@ -1281,6 +1277,7 @@ if (model_name ==
     X_test <- X_test[, keep_predictors, drop = FALSE]
     
     # Median imputation is required only for the vaccination model
+<<<<<<< HEAD
     # if (model_name ==
     #     "Genes + age + sex + vaccination history") {
     # 
@@ -1290,6 +1287,17 @@ if (model_name ==
     # 
     #  preprocessing <- c("zv", "center", "scale")
     # }
+=======
+    if (model_name ==
+        "Genes + age + sex + vaccination history") {
+    
+      preprocessing <- c("medianImpute", "zv", "center", "scale")
+    
+    } else {
+    
+      preprocessing <- c("zv", "center", "scale")
+    }
+>>>>>>> e184143b89ab65c445807889d86194a71c9af2f8
 
     # Inner five-fold cross-validation
     set.seed(1000 + i)
@@ -1385,7 +1393,7 @@ loocv_results
 ```
 
 ```{r}
-# Add standardized RMSE if not already present
+# Add standardized RMSE if not already present for all models (comparison)
 log_model_results$Standardized_RMSE <-
   log_model_results$RMSE / sd(y_log)
 
@@ -1464,11 +1472,6 @@ loocv_error_check %>%
 ```
 
 ```{r}
-sum(head(loocv_error_check$extra_squared_error, 3)) /
-  sum(loocv_error_check$extra_squared_error) * 100
-```
-
-```{r}
 loocv_error_check %>%
   mutate(
     prediction_shift = gene_pred - baseline_pred
@@ -1531,6 +1534,7 @@ table(
   loocv_tuning[["Gene expression"]]$Lambda
 )
 ```
+#### Export LOOCV results as table for appendix
 
 ```{r}
 cv_table <- flextable(cv_comparison) %>%

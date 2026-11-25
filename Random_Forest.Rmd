@@ -13,13 +13,14 @@ knitr::opts_chunk$set(echo = TRUE)
 library("randomForest")
 library("caret")
 library("tidyverse")
+library("here")
 ```
 
 ## Set up 
 
 ```{r}
 # Loading the dataset
-analysis_tpm <- readRDS("analysis_tpm.rds")
+analysis_tpm <- readRDS(here("data", "processed", "analysis_tpm.rds"))
 
 # visualizing dataset
 analysis_tpm[, 1:10] %>%
@@ -474,6 +475,12 @@ model_comparison <- data.frame(
 
 # Display results
 model_comparison
+
+write.csv(
+  model_comparison,
+  here("output", "rf_model_comparison.csv"),
+  row.names = TRUE
+)
 ```
  This suggests that the log transformation did not improve the predictive performance of your Random Forest due to lower RMSE at the original scale.
  
@@ -771,6 +778,12 @@ results_log <- rbind(
 )
 
 results_log
+
+write.csv(
+  results_log,
+  here("output", "rf_demo_model_comparison.csv"),
+  row.names = TRUE
+)
 ```
 The full model is actually performing very slightly better than the baseline, although the difference is extremely small.
 
