@@ -596,7 +596,6 @@ data.frame(
 )
 ```
 
-
 ## Add vaccine history (prep the vaccine history variable for use)
 
 ```{r}
@@ -630,6 +629,7 @@ analysis_tpm %>%
 ```
 
 #### non-transformed outcome export (add in export for the non-transformed elastic nets above for appendix)
+
 ```{r}
 # Appendix figure = Original (untransformed) outcome sensitivity
 
@@ -680,8 +680,7 @@ write.csv(
 )
 ```
 
-
-## Log-transformed outcome, run one chunk to compare all of the 4 models (baseline, gene expression, genes + age + sex, genes + age + sex + vaccines)
+## Log-transformed outcome, run one chunk to compare all of the 4 models (baseline, gene expression, genes + age + sex, genes + age + sex + vaccines) = main model reported
 
 ```{r}
 # Log-transformed outcome: comparison of four models
@@ -852,8 +851,6 @@ stopifnot(
 )
 ```
 
-
-
 ```{r}
 # Calculate RMSE and R2 using log-transformed outcome
 evaluate_log_model <- function(predicted) {
@@ -897,6 +894,7 @@ log_model_tuning
 ```
 
 #### individuals with highest error analysis:
+
 ```{r}
 #### Individuals with highest error
 
@@ -959,6 +957,7 @@ error_df %>%
   select(rank, participant_id, observed_log, predicted_log, squared_error) %>%
   head(10)
 ```
+
 #### Export table of the log-transformed models for the write-up
 
 ```{r}
@@ -1480,6 +1479,7 @@ table(
   loocv_tuning[["Gene expression"]]$Lambda
 )
 ```
+
 #### Export LOOCV results as table for appendix
 
 ```{r}
