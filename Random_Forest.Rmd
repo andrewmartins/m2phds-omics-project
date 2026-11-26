@@ -40,7 +40,7 @@ expressed_genes <- names(gene_totals[gene_totals > 0])
 
 ```{r}
 # Outcome
-Y <- analysis_tpm$plasmablast_frequency
+Y <- analysis_tpm$pf_d7
 
 X_genes <- as.matrix(analysis_tpm[, expressed_genes, drop = FALSE])
 ```
