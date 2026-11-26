@@ -34,7 +34,6 @@ flow_outcome = flow_outcome%>%
       starts_with("value_"), log, .names = "log_{.col}"
     )
   )
-  
 
 flow_outcome
 
@@ -64,22 +63,22 @@ vaccine_hist_agg = vaccine_hist %>%
   summarise(
     n_prior_vax = sum(received %in% c("Yes_selfReported","Yes_Study")) - 1
   )
-
-# calculating median number of prior vaccinations to impute vaccine history
-med_n_vax = median(vaccine_hist_agg$n_prior_vax, na.rm = TRUE)
-
-# calculating median day 0 plasmablast frequency to impute missing data
-med_d0_pf = median(participants$log_value_d0, na.rm = TRUE)
+# 
+# # calculating median number of prior vaccinations to impute vaccine history
+# med_n_vax = median(vaccine_hist_agg$n_prior_vax, na.rm = TRUE)
+# 
+# # calculating median day 0 plasmablast frequency to impute missing data
+# med_d0_pf = median(participants$log_value_d0, na.rm = TRUE)
 
 # joining the vaccine history data to the participants data
-participants = left_join(participants, vaccine_hist_agg, by = "subject")
-
-# median imputation
-participants_cleaned = participants %>%
-  mutate(n_prior_vax = ifelse(is.na(n_prior_vax), med_n_vax, n_prior_vax))
-
-participants_cleaned = participants_cleaned %>%
-  mutate(log_value_d0 = ifelse(is.na(log_value_d0), med_d0_pf, log_value_d0))
+participants_cleaned = left_join(participants, vaccine_hist_agg, by = "subject")
+# 
+# # median imputation
+# participants_cleaned = participants %>%
+#   mutate(n_prior_vax = ifelse(is.na(n_prior_vax), med_n_vax, n_prior_vax))
+# 
+# participants_cleaned = participants_cleaned %>%
+#   mutate(log_value_d0 = ifelse(is.na(log_value_d0), med_d0_pf, log_value_d0))
 
 
 saveRDS(participants_cleaned, here::here("data", "participants_cleaned.rds"))

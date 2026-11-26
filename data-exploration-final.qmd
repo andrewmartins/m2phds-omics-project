@@ -1,0 +1,39 @@
+---
+title: "prelim-analysis"
+format: html
+editor: visual
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidydr)
+library(gtsummary)
+library(here)
+
+cohort = readRDS(here::here("data", "participants_cleaned.rds"))
+rnaseq = readRDS(here::here("data", "rnaseq.rds"))
+vaccine_hist = readRDS(here::here("data", "vaccine_hist.rds"))
+
+table1 <- cohort %>%
+  select(age, biological_sex, n_prior_vax, value_d7) %>%
+  tbl_summary(
+    type = list(n_prior_vax ~ "continuous"),
+    label = list(
+      age            ~ "Age (years)",
+      biological_sex ~ "Sex",
+      n_prior_vax    ~ "Number of prior vaccinations",
+      value_d7        ~ "Plasmablast frequency at day 7 (%)"
+    ),
+    statistic = list(
+      all_continuous()  ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits  = list(value_d7 ~ 4),
+    missing = "ifany",
+    missing_text = "Unknown"
+  )  %>%
+  bold_labels() %>%
+  modify_caption("**Table 1. Characteristics of the study cohort**")
+table1
+```

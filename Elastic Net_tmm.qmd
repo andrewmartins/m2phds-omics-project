@@ -53,55 +53,6 @@ dim(X_mat)
 length(y_vec)
 ```
 
-We transform the TPM values using log2(TPM+1) because RNA-seq gene expression is typically highly skewed since many genes have low expression and only a small number have high expression.
-
-The transformation compresses large values.
-
-### Check the data
-
-```{r}
-# Confirm predictor and outcome dimensions match
-stopifnot(nrow(X_mat) == length(y_vec))
-
-# Check for missing values
-sum(is.na(X_mat))
-sum(is.na(y_vec))
-
-# Check for infinite values
-sum(!is.finite(X_mat))
-
-# Summarize outcome
-summary(y_vec)
-```
-
-### Check gene-expression variability
-
-```{r}
-# Calculate the variance of each gene across participants
-gene_variances <- apply(X_mat, 2, var)
-
-# Count genes with zero and nonzero variance
-sum(gene_variances == 0)
-sum(gene_variances > 0)
-
-# Summarize gene variances
-summary(gene_variances)
-```
-
-A substantial proportion of genes have no variation in expression across the 29 participants (25213) meaning these cannot help the elastic net model distinguish between individuals.
-
--   Total genes = 78,932
-
--   Zero-variance genes = 25,213 (31.9%)
-
--   Nonzero-variance genes = 53,719 (68.1%) (Genes whose expression differs between at least two participants)
-
-Variance here is calculated after transforming expression values using log(TPM+1)
-
-For the final predictive analysis we will have to perform gene filtering within the cross-validation training folds to avoid information leakage. Nonzero variance alone also does not mean that a gene is predictive of plasmablast frequency.
-
-don't remove the 25,213 genes from the entire dataset yet. Instead, we filter genes separately within each training fold, so the held-out participants don't influence preprocessing
-
 ### Elastic net regression with nested cross-validation
 
 ```{r}
@@ -117,158 +68,6 @@ folds <- createFolds(
 # Check number of participants in each test fold
 sapply(folds, length)
 ```
-
-**Outer cross-validation:** Divides the 29 participants into five groups. Each group serves as the test set once, while the remaining participants are used for training.
-
-**Inner cross-validation:** In each outer training set, we use another five-fold cross-validation procedure to select the optimal α and λ
-
-### Fit elastic net using nested cross-validation
-
-```{r}
-
-# =========================================================
-# Nested cross-validation: elastic net
-# =========================================================
-
-# Use the tuning grid and outer folds created previously.
-# Replace the earlier lambda grid with values more appropriate
-# for the small numerical scale of plasmablast frequency.
-
-elastic_net_grid <- expand.grid(
-  alpha = c(0, 0.25, 0.5, 0.75, 1),
-  lambda = c(
-    0.000001,
-    0.00001,
-    0.0001,
-    0.001,
-    0.01,
-    0.05,
-    0.1
-  )
-)
-
-# Create vectors for storing results
-elastic_net_predictions <- rep(NA_real_, length(y_vec))
-baseline_predictions <- rep(NA_real_, length(y_vec))
-
-best_alphas <- rep(NA_real_, length(folds))
-best_lambdas <- rep(NA_real_, length(folds))
-genes_retained <- rep(NA_integer_, length(folds))
-
-# Calculate RMSE only during inner cross-validation
-rmse_only <- function(data, lev = NULL, model = NULL) {
-  c(RMSE = sqrt(mean((data$obs - data$pred)^2)))
-}
-
-# Repeat across all five outer folds
-for (i in seq_along(folds)) {
-
-  cat("Running outer fold", i, "\n")
-
-  # Select held-out participants
-  test_idx <- folds[[i]]
-
-  # Divide data into training and testing sets
-  X_train <- X_mat[-test_idx, , drop = FALSE]
-  X_test  <- X_mat[test_idx, , drop = FALSE]
-  y_train <- y_vec[-test_idx]
-
-  # Identify genes with nonzero variance in training data
-  keep_genes <- apply(X_train, 2, var) > 0
-
-  # Keep the same gene columns in training and testing sets
-  X_train <- X_train[, keep_genes, drop = FALSE]
-  X_test <- X_test[, keep_genes, drop = FALSE]
-
-  genes_retained[i] <- sum(keep_genes)
-
-  # Inner cross-validation selects alpha and lambda
-  elastic_net_model <- caret::train(
-    x = X_train,
-    y = y_train,
-    method = "glmnet",
-    tuneGrid = elastic_net_grid,
-    trControl = trainControl(
-      method = "cv",
-      number = 5,
-      summaryFunction = rmse_only
-    ),
-    metric = "RMSE",
-    standardize = TRUE
-  )
-
-  # Predict participants in the held-out outer fold
-  elastic_net_predictions[test_idx] <- as.numeric(
-    predict(elastic_net_model, newdata = X_test)
-  )
-
-  # Simple reference model: training-set mean outcome
-  baseline_predictions[test_idx] <- mean(y_train)
-
-  # Store selected tuning parameters
-  best_alphas[i] <- elastic_net_model$bestTune$alpha
-  best_lambdas[i] <- elastic_net_model$bestTune$lambda
-}
-
-# Confirm all participants have a prediction
-# stopifnot(
-#   !anyNA(elastic_net_predictions),
-#   !anyNA(baseline_predictions)
-# )
-
-```
-
-#### Evaluate elastic net
-
-```{r}
-
-# RMSE: average magnitude of prediction errors
-rmse_elastic_net <- sqrt(
-  mean((y_vec - elastic_net_predictions)^2)
-)
-
-# Pooled cross-validated R-squared
-r2_elastic_net <- 1 -
-  sum((y_vec - elastic_net_predictions)^2) /
-  sum((y_vec - mean(y_vec))^2)
-
-# Compare with a simple baseline model
-rmse_baseline <- sqrt(
-  mean((y_vec - baseline_predictions)^2)
-)
-
-r2_baseline <- 1 -
-  sum((y_vec - baseline_predictions)^2) /
-  sum((y_vec - mean(y_vec))^2)
-
-# Display results
-data.frame(
-  model = c("Elastic net", "Training-mean baseline"),
-  RMSE = c(rmse_elastic_net, rmse_baseline),
-  R2 = c(r2_elastic_net, r2_baseline)
-)
-
-# Inspect selected hyperparameters and retained genes
-data.frame(
-  fold = seq_along(folds),
-  alpha = best_alphas,
-  lambda = best_lambdas,
-  genes_retained = genes_retained
-)
-
-
-
-```
-
-RMSE = lower is better
-
-baseline model is extremely simple. it doesn't use gene expression at all and just predicts the average plasmablast frequency of the training participants (just a simple average)
-
-R^2^ = 1 is perfect prediction, R^2^ = 0 means predictions are as good as the overall sample mean, and R\^2 below 0 means predictions are worse than that overall-mean benchmark
-
--   **Small lambda:** The model is allowed to rely more strongly on gene expression patterns.
-
--   **Large lambda:** The model shrinks the gene coefficients more heavily, making its predictions less dependent on those patterns.
 
 ### Additional analyses
 
@@ -305,391 +104,6 @@ colnames(demographic_mat)
 #   all(is.finite(X_combined))
 # )
 
-```
-
-### Fit the combined elastic net
-
-```{r}
-
-# Store predictions for each participant
-combined_predictions <- rep(NA_real_, length(y_vec))
-
-# Store the best tuning parameters
-combined_alphas <- rep(NA_real_, length(folds))
-combined_lambdas <- rep(NA_real_, length(folds))
-combined_genes_retained <- rep(NA_integer_, length(folds))
-
-# Reuse the SAME outer folds and tuning grid
-for (i in seq_along(folds)) {
-
-  cat("Running combined model - outer fold", i, "\n")
-
-  # 1. Select held-out participants
-  test_idx <- folds[[i]]
-
-  # 2. Split training and testing data
-  X_train <- X_combined[-test_idx, , drop = FALSE]
-  X_test  <- X_combined[test_idx, , drop = FALSE]
-
-  y_train <- y_vec[-test_idx]
-
-  # 3. Remove zero-variance predictors using training data
-  #keep_predictors <- apply(X_train, 2, var) > 0
-
-  # X_train <- X_train[, keep_predictors, drop = FALSE]
-  # X_test  <- X_test[, keep_predictors, drop = FALSE]
-
-  # combined_genes_retained[i] <- sum(
-  #   keep_predictors[seq_len(ncol(X_mat))]
-  # )
-
-  # 4. Tune alpha and lambda using inner cross-validation
-  combined_model <- caret::train(
-    x = X_train,
-    y = y_train,
-    method = "glmnet",
-    tuneGrid = elastic_net_grid,
-    trControl = trainControl(
-      method = "cv",
-      number = 5,
-      summaryFunction = rmse_only
-    ),
-    metric = "RMSE",
-    preProcess = c("zv", "center", "scale"),
-    standardize = FALSE,
-    penalty.factor = pf
-  )
-
-  # 5. Predict held-out participants
-  combined_predictions[test_idx] <- as.numeric(
-    predict(combined_model, newdata = X_test)
-  )
-
-  # 6. Store selected parameters
-  combined_alphas[i] <- combined_model$bestTune$alpha
-  combined_lambdas[i] <- combined_model$bestTune$lambda
-}
-
-# Check that all 29 participants received predictions
-stopifnot(
-  !anyNA(combined_predictions),
-  all(is.finite(combined_predictions))
-)
-
-```
-
-### RMSE and R\^2
-
-```{r}
-
-# RMSE for combined model
-rmse_combined <- sqrt(
-  mean((y_vec - combined_predictions)^2)
-)
-
-# Cross-validated R-squared
-r2_combined <- 1 -
-  sum((y_vec - combined_predictions)^2) /
-  sum((y_vec - mean(y_vec))^2)
-
-# Compare all four models
-model_comparison <- data.frame(
-  Model = c(
-    "Mean-only baseline (non-transformed)",
-    "Gene-expression elastic net (non-transformed)",
-    "Combined elastic net (non-transformed)"
-  ),
-  RMSE = c(
-    rmse_baseline,
-    rmse_elastic_net,
-    rmse_combined
-  ),
-  R2 = c(
-    r2_baseline,
-    r2_elastic_net,
-    r2_combined
-  )
-)
-
-model_comparison
-
-# Selected alpha and lambda in each outer fold
-data.frame(
-  fold = seq_along(folds),
-  alpha = combined_alphas,
-  lambda = combined_lambdas,
-  genes_retained = combined_genes_retained
-)
-
-
-```
-
-The gene-expression-only model performed best, although its advantage over the mean-only baseline was extremely small.
-
-The combined model performed worse than both gene expression alone and the mean-only baseline.
-
-### Sensitivity analysis: Log-transforming the outcome
-
-```{r}
-# Log-transform Day 7 plasmablast frequency
-y_log <- log(y_vec)
-
-# Create output folder if needed
-dir.create("output", showWarnings = FALSE)
-
-# -----------------------------------------
-# 1. Side-by-side comparison
-# -----------------------------------------
-
-pdf(
-  "output/plasmablast_transformation_comparison.pdf",
-  width = 10,
-  height = 5
-)
-
-par(mfrow = c(1, 2))
-
-hist(
-  y_vec,
-  breaks = 10,
-  main = "Original plasmablast frequency",
-  xlab = "Day 7 plasmablast frequency",
-  col = "lightblue"
-)
-
-hist(
-  y_log,
-  breaks = 10,
-  main = "Log-transformed frequency",
-  xlab = "Log(Day 7 plasmablast frequency)",
-  col = "lightblue"
-)
-
-dev.off()
-
-# -----------------------------------------
-# 2. Log-transformed distribution only
-# -----------------------------------------
-
-pdf(
-  "output/plasmablast_log_transformed.pdf",
-  width = 7,
-  height = 5
-)
-
-hist(
-  y_log,
-  breaks = 10,
-  main = "Distribution of log-transformed Day 7 plasmablast frequency",
-  xlab = "Log(Day 7 plasmablast frequency)",
-  ylab = "Number of participants",
-  col = "lightblue"
-)
-
-dev.off()
-
-# Display log-transformed histogram in Quarto
-hist(
-  y_log,
-  breaks = 10,
-  main = "Distribution of log-transformed Day 7 plasmablast frequency",
-  xlab = "Log(Day 7 plasmablast frequency)",
-  ylab = "Number of participants",
-  col = "lightblue"
-)
-
-summary(y_log)
-```
-
-#### Fit the elastic net using this log-transformed outcome
-
-```{r}
-# Store predictions and selected hyperparameters
-log_predictions <- rep(NA_real_, length(y_vec))
-
-log_alphas <- rep(NA_real_, length(folds))
-log_lambdas <- rep(NA_real_, length(folds))
-# Wider lambda grid for the log-transformed outcome
-log_elastic_net_grid <- expand.grid(
-  alpha = c(0, 0.25, 0.5, 0.75, 1),
-  lambda = c(
-    0.000001,
-    0.00001,
-    0.0001,
-    0.001,
-    0.01,
-    0.05,
-    0.1,
-    0.2,
-    0.5,
-    1
-  )
-)
-
-for (i in seq_along(folds)) {
-  cat("Running log-transformed model - outer fold", i, "\n")
-
-  test_idx <- folds[[i]]
-
-  # Split expression data
-  X_train <- X_mat[-test_idx, , drop = FALSE]
-  X_test <- X_mat[test_idx, , drop = FALSE]
-
-  # Use log-transformed outcome
-  y_train <- y_log[-test_idx]
-
-  # Remove zero-variance genes using training data only
-  keep_genes <- apply(X_train, 2, var) > 0
-
-  X_train <- X_train[, keep_genes, drop = FALSE]
-  X_test <- X_test[, keep_genes, drop = FALSE]
-
-  # Fit elastic net with inner 5-fold CV
-  log_model <- caret::train(
-    x = X_train,
-    y = y_train,
-    method = "glmnet",
-    tuneGrid = log_elastic_net_grid,
-    trControl = trainControl(
-      method = "cv",
-      number = 5,
-      summaryFunction = rmse_only
-    ),
-    metric = "RMSE",
-    preProcess = c("zv", "center", "scale"),
-    standardize = FALSE,
-    penalty.factor = pf
-  )
-
-  # Predict on log scale and back-transform
-  pred_log <- predict(log_model, newdata = X_test)
-
-  log_predictions[test_idx] <- exp(pred_log)
-
-  # Save selected parameters
-  log_alphas[i] <- log_model$bestTune$alpha
-  log_lambdas[i] <- log_model$bestTune$lambda
-}
-```
-
-#### Compare predictive performance
-
-```{r}
-# Performance on original outcome scale
-log_rmse <- sqrt(mean((y_vec - log_predictions)^2))
-
-log_r2 <- 1 -
-  sum((y_vec - log_predictions)^2) /
-  sum((y_vec - mean(y_vec))^2)
-
-# Compare models
-data.frame(
-  Model = c(
-    "Original outcome",
-    "Log-transformed outcome"
-  ),
-  RMSE = c(
-    sqrt(mean((y_vec - elastic_net_predictions)^2)),
-    log_rmse
-  ),
-  R2 = c(
-    1 - sum((y_vec - elastic_net_predictions)^2) /
-      sum((y_vec - mean(y_vec))^2),
-    log_r2
-  )
-)
-
-data.frame(
-  Fold = seq_along(folds),
-  Alpha = log_alphas,
-  Lambda = log_lambdas
-)
-```
-
-## Add vaccine history
-
-```{r}
-# Load vaccination history
-vaccine_hist <- readRDS(
-  here("data", "vaccine_hist.rds")
-)
-
-# Identify participants with documented history
-# The vaccine history dataset uses the subject identifier
-vax_available <- analysis_tmm$subject %in% vaccine_hist$subject
-
-# Undocumented histories are missing, not confirmed zeros
-vax_count <- analysis_tmm$n_prior_vax
-vax_count[!vax_available] <- NA_real_
-
-stopifnot(sum(is.na(vax_count)) == 2)
-
-
-# Check availability
-table(vax_available)
-
-# Examine vaccination counts among participants with records
-summary(analysis_tmm$n_prior_vax[vax_available])
-
-# Check the two participants without documented history
-analysis_tmm %>%
-  filter(!vax_available) %>%
-  select(participant_id, subject, n_prior_vax)
-
-```
-
-#### non-transformed outcome export
-
-```{r}
-# =========================================================
-# Appendix: Original (untransformed) outcome sensitivity
-# =========================================================
-
-# Create results table
-original_outcome_results <- data.frame(
-  Model = c(
-    "Training-mean baseline",
-    "Gene-expression elastic net"
-  ),
-  RMSE = c(
-    rmse_baseline,
-    rmse_elastic_net
-  ),
-  Standardized_RMSE = c(
-    rmse_baseline / sd(y_vec),
-    rmse_elastic_net / sd(y_vec)
-  ),
-  R2 = c(
-    r2_baseline,
-    r2_elastic_net
-  )
-)
-
-original_outcome_results
-
-# Create editable Word table
-original_table <- flextable::flextable(
-  original_outcome_results
-) %>%
-  flextable::colformat_num(
-    j = c("RMSE", "Standardized_RMSE", "R2"),
-    digits = 3
-  ) %>%
-  flextable::autofit()
-
-# Export
-flextable::save_as_docx(
-  "Appendix Table A3. Untransformed-outcome sensitivity analysis" =
-    original_table,
-  path = here("output", "appendix_original_outcome.docx")
-)
-
-# Also save precise numerical results as CSV
-write.csv(
-  original_outcome_results,
-  here("output", "appendix_original_outcome.csv"),
-  row.names = FALSE
-)
 ```
 
 ## Log-transformed outcome: comparison of the 4 models
@@ -736,6 +150,10 @@ log_models <- list(
   "Genes + age + sex" = X_log_demographic,
   "Genes + age + sex + vaccination history" = X_log_demographic
 )
+
+rmse_only <- function(data, lev = NULL, model = NULL) {
+  c(RMSE = sqrt(mean((data$obs - data$pred)^2)))
+}
 ```
 
 ```{r}
@@ -785,48 +203,57 @@ for (model_name in names(log_models)) {
     y_train <- y_log[-test_idx]
 
     # Add vaccination history only for the third model
-    if (model_name ==
-        "Genes + age + sex + vaccination history") {
+    if (model_name == "Genes + age + sex + vaccination history") {
 
-      # Keep missing values as NA
-      # caret will impute them within each inner training fold
-      X_train <- cbind(
-        X_train,
-      n_prior_vax = vax_count[-test_idx]
-    )
-          X_test <- cbind(
-        X_test,
-        n_prior_vax = vax_count[test_idx]
-      )
+      median_impute <- function(X_train, X_test) {
+          na_cols <- which(colSums(is.na(X_train)) > 0 | colSums(is.na(X_test)) > 0)
+          for (j in na_cols) {
+            med <- median(X_train[, j], na.rm = TRUE)
+            X_train[is.na(X_train[, j]), j] <- med
+            X_test[is.na(X_test[, j]), j]   <- med
+          }
+        list(train = X_train, test = X_test)
+      }
+      
+      X_train <- cbind(X_train, n_prior_vax = vax_count[-test_idx])
+      X_test  <- cbind(X_test,  n_prior_vax = vax_count[test_idx])
+      
+      imp     <- median_impute(X_train, X_test)
+      X_train <- imp$train
+      X_test  <- imp$test
     }
 
-
+    covars <- c("age", "biological_sexMale")
         # Identify nonzero-variance predictors using outer training data
     # na.rm = TRUE allows the vaccination variable to contain NA
-    keep_predictors <- apply(
-      X_train,
-      2,
-      function(x) {
-        v <- var(x, na.rm = TRUE)
-        is.finite(v) && v > 0
-      }
-    )
+    # keep_predictors <- apply(
+    #   X_train,
+    #   2,
+    #   function(x) {
+    #     v <- var(x, na.rm = TRUE)
+    #     is.finite(v) && v > 0
+    #   }
+    # )
     
-    X_train <- X_train[, keep_predictors, drop = FALSE]
-    X_test <- X_test[, keep_predictors, drop = FALSE]
-    
+    # X_train <- X_train[, keep_predictors, drop = FALSE]
+    # X_test <- X_test[, keep_predictors, drop = FALSE]
+    # 
     # Median imputation is required only for the vaccination model
-    if (model_name ==
-        "Genes + age + sex + vaccination history") {
-    
-      preprocessing <- c("medianImpute", "zv", "center", "scale")
-    
-    } else {
-    
-      preprocessing <- c("zv", "center", "scale")
-    }
+    # if (model_name ==
+    #     "Genes + age + sex + vaccination history") {
+    # 
+    #   preprocessing <- c("zv", "center", "scale")
+    # 
+    # } else {
+    # 
+    # preprocessing <- c("zv", "center", "scale")
+    # }
 
     # Use the same inner CV splits for each model
+    
+    pf <- ifelse(colnames(X_train) %in% covars, 0, 1)
+    
+    
     set.seed(1000 + i)
 
     inner_folds <- createFolds(
@@ -847,8 +274,8 @@ for (model_name in names(log_models)) {
         summaryFunction = rmse_only
       ),
       metric = "RMSE",
-      preProcess = preprocessing,
-      standardize = FALSE,
+      #preProcess = preprocessing,
+      standardize = TRUE,
       penalty.factor = pf
     )
 
@@ -908,284 +335,6 @@ log_model_results$Standardized_RMSE <-
 log_model_results
 ```
 
-```{r}
-# Selected alpha and lambda for each model
-log_model_tuning
-```
-
-#### individuals with highest error:
-
-```{r}
-#### Individuals with highest error
-
-# Create participant-level squared errors for the main model
-error_df <- tibble(
-  participant_id = analysis_tmm$participant_id,
-  observed_log = y_log,
-  predicted_log = log_model_predictions[["Gene expression"]],
-  squared_error = (y_log - log_model_predictions[["Gene expression"]])^2
-) %>%
-  arrange(desc(squared_error)) %>%
-  mutate(
-    rank = row_number(),
-    top3 = rank <= 3
-  )
-
-# Percent of total squared error from the top 3 participants
-top3_percent <- 100 * sum(error_df$squared_error[1:3]) / sum(error_df$squared_error)
-top3_percent
-
-# Plot for appendix
-error_plot <- ggplot(error_df, aes(
-  x = reorder(participant_id, squared_error),
-  y = squared_error,
-  fill = top3
-)) +
-  geom_col() +
-  coord_flip() +
-  scale_fill_manual(values = c("FALSE" = "grey75", "TRUE" = "firebrick")) +
-  labs(
-    title = "Participant-level squared prediction errors",
-    subtitle = paste0(
-      "Top 3 participants account for ",
-      round(top3_percent, 1),
-      "% of total squared error"
-    ),
-    x = "Participant ID",
-    y = "Squared prediction error",
-    fill = "Top 3 error"
-  ) +
-  theme_minimal() +
-  theme(
-    legend.position = "top",
-    plot.title = element_text(face = "bold")
-  )
-
-error_plot
-
-# Save for appendix
-ggsave(
-  filename = here("output", "appendix_top_squared_errors.png"),
-  plot = error_plot,
-  width = 8,
-  height = 6,
-  dpi = 300
-)
-
-# Optional: show the top 10 contributors in table form
-error_df %>%
-  select(rank, participant_id, observed_log, predicted_log, squared_error) %>%
-  head(10)
-```
-
-```{r}
-# Export primary model comparison as an editable Word table
-primary_table <- flextable(log_model_results) %>%
-  colformat_num(
-    j = c("RMSE", "R2", "Standardized_RMSE"),
-    digits = 3
-  ) %>%
-  autofit()
-
-save_as_docx(
-  "Table 2. Primary elastic net model performance" = primary_table,
-  path = here("output", "table2_primary_models.docx")
-)
-
-# Save numerical results for later use
-saveRDS(
-  log_model_results,
-  here("output", "primary_model_results.rds")
-)
-
-```
-
-```{r}
-primary_plot <- ggplot(
-  primary_predictions,
-  aes(x = observed, y = predicted)
-) +
-  geom_point(
-    size = 2.5,
-    color = "black",
-    alpha = 0.8
-  ) +
-  geom_abline(
-    slope = 1,
-    intercept = 0,
-    linetype = "dashed",
-    color = "grey50"
-  ) +
-  scale_x_continuous(
-    breaks = seq(0, 0.035, 0.005)
-  ) +
-  coord_cartesian(
-    xlim = c(0, 0.035),
-    ylim = c(0.003, 0.009)
-  ) +
-  labs(
-    title = "Elastic Net: Observed vs Predicted",
-    subtitle = "Five-fold nested cross-validation",
-    x = "Observed Day 7 plasmablast frequency",
-    y = "Predicted Day 7 plasmablast frequency"
-  ) +
-  theme_minimal(base_size = 13)
-
-primary_plot
-
-ggsave(
-  here("output", "figure_elastic_net_log_predictions.pdf"),
-  primary_plot,
-  width = 7,
-  height = 5
-)
-```
-
-### Try 0 imputation for vaccination (on log-transformed data)
-
-```{r}
-# =========================================================
-# Sensitivity analysis: Zero imputation of vaccination history
-# Log-transformed outcome, n = 29
-# =========================================================
-
-# Store predictions and selected hyperparameters
-zero_vax_predictions <- rep(NA_real_, length(y_log))
-
-zero_vax_alphas <- rep(NA_real_, length(folds))
-zero_vax_lambdas <- rep(NA_real_, length(folds))
-
-for (i in seq_along(folds)) {
-
-  cat("Running zero-imputation model - fold", i, "\n")
-
-  test_idx <- folds[[i]]
-
-  # Split predictors and outcome
-  X_train <- X_combined[-test_idx, , drop = FALSE]
-  X_test <- X_combined[test_idx, , drop = FALSE]
-
-  y_train <- y_log[-test_idx]
-
-  # Extract vaccination history
-  vax_train <- vax_count[-test_idx]
-  vax_test <- vax_count[test_idx]
-
-  # Replace missing histories with zero
-  vax_train[is.na(vax_train)] <- 0
-  vax_test[is.na(vax_test)] <- 0
-
-  # Add vaccination history to gene expression + demographics
-  X_train <- cbind(X_train, n_prior_vax = vax_train)
-  X_test <- cbind(X_test, n_prior_vax = vax_test)
-
-  # Remove zero-variance predictors using training data only
-  keep_predictors <- apply(X_train, 2, var) > 0
-
-  X_train <- X_train[, keep_predictors, drop = FALSE]
-  X_test <- X_test[, keep_predictors, drop = FALSE]
-
-  # Use same inner CV splits as the primary analysis
-  set.seed(1000 + i)
-
-  inner_folds <- createFolds(
-    y_train,
-    k = 5,
-    returnTrain = TRUE
-  )
-
-  # Fit elastic net
-  zero_vax_model <- caret::train(
-    x = X_train,
-    y = y_train,
-    method = "glmnet",
-    tuneGrid = log_elastic_net_grid,
-    trControl = trainControl(
-      method = "cv",
-      index = inner_folds,
-      summaryFunction = rmse_only
-    ),
-    metric = "RMSE",
-    preProcess = c("zv", "center", "scale"),
-    standardize = FALSE,
-    penalty.factor = pf
-  )
-
-  # Predict held-out participants on log scale
-  zero_vax_predictions[test_idx] <- as.numeric(
-    predict(zero_vax_model, newdata = X_test)
-  )
-
-  # Store selected hyperparameters
-  zero_vax_alphas[i] <- zero_vax_model$bestTune$alpha
-  zero_vax_lambdas[i] <- zero_vax_model$bestTune$lambda
-}
-
-stopifnot(!anyNA(zero_vax_predictions))
-```
-
-#### compare 0 and median imputation:
-
-```{r}
-# Median-imputation predictions from primary analysis
-median_vax_predictions <- log_model_predictions[["Genes + age + sex + vaccination history"]]
-
-# Function to calculate performance on log scale
-evaluate_log <- function(predicted) {
-  c(
-    RMSE = sqrt(mean((y_log - predicted)^2)),
-    R2 = 1 - sum((y_log - predicted)^2) /
-      sum((y_log - mean(y_log))^2),
-    Standardized_RMSE =
-      sqrt(mean((y_log - predicted)^2)) / sd(y_log)
-  )
-}
-
-# Compare models
-zero_imputation_results <- rbind(
-  "Genes + age + sex" =
-    evaluate_log(
-      log_model_predictions[["Genes + age + sex"]]
-    ),
-
-  "Median imputation" =
-    evaluate_log(median_vax_predictions),
-
-  "Zero imputation" =
-    evaluate_log(zero_vax_predictions)
-)
-
-zero_imputation_results
-```
-
-```{r}
-data.frame(
-  Fold = seq_along(folds),
-  Alpha = zero_vax_alphas,
-  Lambda = zero_vax_lambdas
-)
-```
-
-```{r}
-zero_table <- flextable(
-  data.frame(
-    Model = rownames(zero_imputation_results),
-    zero_imputation_results,
-    row.names = NULL
-  )
-) %>%
-  colformat_num(
-    j = c("RMSE", "R2", "Standardized_RMSE"),
-    digits = 3
-  ) %>%
-  autofit()
-
-save_as_docx(
-  "Sensitivity analysis: Vaccination-history imputation" = zero_table,
-  path = here("output", "sensitivity_imputation.docx")
-)
-```
-
 ## Leave-one-out cross validation analysis
 
 ```{r}
@@ -1201,9 +350,9 @@ loocv_predictions <- list(
   "Training-mean baseline" = rep(NA_real_, n),
   "Gene expression" = rep(NA_real_, n),
   "Genes + age + sex" = rep(NA_real_, n),
-  "Genes + age + sex + vaccination history" = rep(NA_real_, n),
-  "Genes + age + sex + day 0 plasmablast frequency" = rep(NA_real_, n),
-  "Genes + age + sex + vaccination history + day 0 plasmablast frequency" = rep(NA_real_, n)
+  "Genes + age + sex + vaccination history" = rep(NA_real_, n)
+  #"Genes + age + sex + day 0 plasmablast frequency" = rep(NA_real_, n),
+  #"Genes + age + sex + vaccination history + day 0 plasmablast frequency" = rep(NA_real_, n)
 )
 
 # Store elastic net tuning parameters
@@ -1213,9 +362,9 @@ loocv_tuning <- list()
 loocv_models <- list(
   "Gene expression" = X_mat,
   "Genes + age + sex" = X_combined,
-  "Genes + age + sex + vaccination history" = X_combined,
-  "Genes + age + sex + day 0 plasmablast frequency" = X_combined,
-  "Genes + age + sex + vaccination history + day 0 plasmablast frequency" = X_combined
+  "Genes + age + sex + vaccination history" = X_combined
+  #"Genes + age + sex + day 0 plasmablast frequency" = X_combined,
+  #"Genes + age + sex + vaccination history + day 0 plasmablast frequency" = X_combined
 )
 
 for (model_name in names(loocv_models)) {
@@ -1249,77 +398,26 @@ for (model_name in names(loocv_models)) {
     covars <- c("age", "biological_sexMale")
 
     # Add vaccination history only for the third model
-    if (model_name ==
-        "Genes + age + sex + vaccination history") {
+    if (model_name == "Genes + age + sex + vaccination history") {
       
       covars <- c("age", "biological_sexMale", "n_prior_vax")
-    
-      # Keep missing values as NA
-      # caret will impute them within each inner training fold
-      X_train <- cbind(
-        X_train,
-        n_prior_vax = vax_count[-test_idx]
-      )
       
-      X_test <- cbind(
-        X_test,
-        n_prior_vax = vax_count[test_idx]
-      )
+      median_impute <- function(X_train, X_test) {
+          na_cols <- which(colSums(is.na(X_train)) > 0 | colSums(is.na(X_test)) > 0)
+          for (j in na_cols) {
+            med <- median(X_train[, j], na.rm = TRUE)
+            X_train[is.na(X_train[, j]), j] <- med
+            X_test[is.na(X_test[, j]), j]   <- med
+          }
+        list(train = X_train, test = X_test)
+      }
+      
+      imp     <- median_impute(X_train, X_test)
+      X_train <- imp$train
+      X_test  <- imp$test
     }
     
-    else if (model_name ==
-        "Genes + age + sex + day 0 plasmablast frequency") {
-      
-      covars <- c("age", "biological_sexMale", "log_pf_d0")
     
-      # Keep missing values as NA
-      # caret will impute them within each inner training fold
-      X_train <- cbind(
-        X_train,
-        log_pf_d0 = log_pf_d0[-test_idx]
-      )
-      
-      X_test <- cbind(
-        X_test,
-        log_pf_d0 = log_pf_d0[test_idx]
-      )
-    }
-    
-    else if (model_name ==
-        "Genes + age + sex + vaccination history + day 0 plasmablast frequency") {
-      
-      covars <- c("age", "biological_sexMale", "n_prior_vax", "log_pf_d0")
-    
-      # Keep missing values as NA
-      # caret will impute them within each inner training fold
-      X_train <- cbind(
-        X_train,
-        n_prior_vax = vax_count[-test_idx],
-        log_pf_d0 = log_pf_d0[-test_idx]
-      )
-      
-      X_test <- cbind(
-        X_test,
-        n_prior_vax = vax_count[test_idx],
-        log_pf_d0 = log_pf_d0[test_idx]
-      )
-    }
-
-    # Identify nonzero-variance predictors using outer training data
-    # na.rm = TRUE allows the vaccination variable to contain NA
-    
-    # Median imputation is required only for the vaccination model
-    # if (model_name %in% 
-    #     c("Genes + age + sex + vaccination history",
-    #       "Genes + age + sex + day 0 plasmablast frequency",
-    #       "Genes + age + sex + vaccination history + day 0 plasmablast frequency")
-    #     ){
-    #   preprocessing <- "medianImpute"
-    # 
-    # } else {
-    # 
-    #   preprocessing <- NULL
-    # }
     
     pf <- ifelse(colnames(X_train) %in% covars, 0, 1)
 
@@ -1345,7 +443,7 @@ for (model_name in names(loocv_models)) {
         summaryFunction = rmse_only
       ),
       metric = "RMSE",
-      # preProcess = preprocessing,
+      #preProcess = c("zv", "center", "scale"),
       standardize = TRUE,
       penalty.factor = pf
     )
@@ -1419,144 +517,181 @@ cv_comparison <- rbind(
 cv_comparison
 ```
 
-#### check if a few participants are driving the error
+## Leave-one-out cross validation analysis with B_cell subset
 
 ```{r}
-# Compare participant-level prediction errors
-loocv_diagnostics <- data.frame(
-  participant_id = analysis_tmm$participant_id,
-  observed = y_log,
-  baseline = loocv_predictions[["Training-mean baseline"]],
-  gene_predicted = loocv_predictions[["Gene expression"]],
-  combined_predicted = loocv_predictions[["Genes + age + sex"]]
-) %>%
-  mutate(
-    gene_squared_error = (observed - gene_predicted)^2,
-    baseline_squared_error = (observed - baseline)^2
-  ) %>%
-  arrange(desc(gene_squared_error))
+# =========================================================
+# Sensitivity analysis: Nested LOOCV
+# Log-transformed outcome, n = 29
+# B cell gene subset
+# =========================================================
 
-# Largest prediction errors
-head(loocv_diagnostics, 10)
+n <- length(y_log)
 
-# Percentage of total error from the three largest errors
-100 * sum(head(loocv_diagnostics$gene_squared_error, 3)) /
-  sum(loocv_diagnostics$gene_squared_error)
-```
 
-```{r}
-# Compare individual LOOCV errors and tuning parameters
+bcells <- readRDS(here("data","Bcell_predictive_dataset.rds"))
 
-loocv_error_check <- data.frame(
-  participant_id = analysis_tmm$participant_id,
-  observed_log = y_log,
-  baseline_pred = loocv_predictions[["Training-mean baseline"]],
-  gene_pred = loocv_predictions[["Gene expression"]],
-  alpha = loocv_tuning[["Gene expression"]]$Alpha,
-  lambda = loocv_tuning[["Gene expression"]]$Lambda
-) %>%
-  mutate(
-    baseline_squared_error = (observed_log - baseline_pred)^2,
-    gene_squared_error = (observed_log - gene_pred)^2,
-    extra_squared_error =
-      gene_squared_error - baseline_squared_error
-  ) %>%
-  arrange(desc(extra_squared_error))
+genes_of_interest <- bcells$gene_sets$B_cell
 
-# Show participants for whom elastic net performed
-# most poorly relative to the training-mean baseline
-loocv_error_check %>%
-  select(
-    participant_id,
-    observed_log,
-    baseline_pred,
-    gene_pred,
-    alpha,
-    lambda,
-    extra_squared_error
-  ) %>%
-  head(10)
-```
 
-```{r}
-sum(head(loocv_error_check$extra_squared_error, 3)) /
-  sum(loocv_error_check$extra_squared_error) * 100
-```
+keep <- intersect(genes_of_interest, colnames(X_mat))
 
-```{r}
-loocv_error_check %>%
-  mutate(
-    prediction_shift = gene_pred - baseline_pred
-  ) %>%
-  arrange(desc(abs(prediction_shift))) %>%
-  select(
-    participant_id,
-    observed_log,
-    baseline_pred,
-    gene_pred,
-    alpha,
-    lambda,
-    prediction_shift
-  ) %>%
-  head(10)
-```
+length(genes_of_interest)
+length(keep)
 
-```{r}
-# Check how unusual each participant's gene-expression profile is
+X_sub <- X_mat[, keep, drop = FALSE]
 
-expression_distance <- sapply(seq_len(nrow(X_mat)), function(i) {
-
-  X_train <- X_mat[-i, , drop = FALSE]
-  X_test <- X_mat[i, ]
-
-  # Standardize using training data only
-  train_mean <- colMeans(X_train)
-  train_sd <- apply(X_train, 2, sd)
-
-  # Exclude genes without variability
-  keep <- train_sd > 0
-
-  # Mean absolute standardized difference
-  mean(abs(
-    (X_test[keep] - train_mean[keep]) / train_sd[keep]
-  ))
-})
-
-expression_diagnostics <- data.frame(
-  participant_id = analysis_tmm$participant_id,
-  expression_distance = expression_distance,
-  loocv_error = (
-    y_log - loocv_predictions[["Gene expression"]]
-  )^2
+X_combined <- cbind(
+  X_sub,
+  demographic_mat
 )
 
-expression_diagnostics %>%
-  arrange(desc(loocv_error)) %>%
-  head(10)
+# Store predictions for all four models
+loocv_predictions <- list(
+  "Training-mean baseline" = rep(NA_real_, n),
+  "Gene expression" = rep(NA_real_, n),
+  "Genes + age + sex" = rep(NA_real_, n),
+  "Genes + age + sex + vaccination history" = rep(NA_real_, n)
+  #"Genes + age + sex + day 0 plasmablast frequency" = rep(NA_real_, n),
+  #"Genes + age + sex + vaccination history + day 0 plasmablast frequency" = rep(NA_real_, n)
+)
+
+# Store elastic net tuning parameters
+loocv_tuning <- list()
+
+# Three elastic net predictor sets
+loocv_models <- list(
+  "Gene expression" = X_sub,
+  "Genes + age + sex" = X_combined,
+  "Genes + age + sex + vaccination history" = X_combined
+  #"Genes + age + sex + day 0 plasmablast frequency" = X_combined,
+  #"Genes + age + sex + vaccination history + day 0 plasmablast frequency" = X_combined
+)
+
+for (model_name in names(loocv_models)) {
+
+  cat("\nRunning LOOCV:", model_name, "\n")
+
+  X_current <- loocv_models[[model_name]]
+
+  tuning <- data.frame(
+    Participant = seq_len(n),
+    Alpha = NA_real_,
+    Lambda = NA_real_
+  )
+
+  for (i in seq_len(n)) {
+
+    cat("Held-out participant", i, "of", n, "\n")
+
+    # Hold out one participant
+    test_idx <- i
+
+    X_train <- X_current[-test_idx, , drop = FALSE]
+    X_test <- X_current[test_idx, , drop = FALSE]
+    
+    y_train <- y_log[-test_idx]
+
+    # Training-mean baseline
+    loocv_predictions[["Training-mean baseline"]][test_idx] <-
+      mean(y_train)
+    
+    covars <- c("age", "biological_sexMale")
+
+    # Add vaccination history only for the third model
+    if (model_name == "Genes + age + sex + vaccination history") {
+      
+      covars <- c("age", "biological_sexMale", "n_prior_vax")
+      
+      median_impute <- function(X_train, X_test) {
+          na_cols <- which(colSums(is.na(X_train)) > 0 | colSums(is.na(X_test)) > 0)
+          for (j in na_cols) {
+            med <- median(X_train[, j], na.rm = TRUE)
+            X_train[is.na(X_train[, j]), j] <- med
+            X_test[is.na(X_test[, j]), j]   <- med
+          }
+        list(train = X_train, test = X_test)
+      }
+      
+      imp     <- median_impute(X_train, X_test)
+      X_train <- imp$train
+      X_test  <- imp$test
+    }
+    
+    pf <- ifelse(colnames(X_train) %in% covars, 0, 1)
+
+
+    # Inner five-fold cross-validation
+    set.seed(1000 + i)
+
+    inner_folds <- createFolds(
+      y_train,
+      k = 5,
+      returnTrain = TRUE
+    )
+
+    # Fit elastic net
+    model <- caret::train(
+      x = X_train,
+      y = y_train,
+      method = "glmnet",
+      tuneGrid = log_elastic_net_grid,
+      trControl = trainControl(
+        method = "cv",
+        index = inner_folds,
+        summaryFunction = rmse_only
+      ),
+      metric = "RMSE",
+      #preProcess = c("zv", "center", "scale"),
+      standardize = TRUE,
+      penalty.factor = pf
+    )
+
+    # Predict held-out participant on log scale
+    loocv_predictions[[model_name]][test_idx] <-
+      as.numeric(predict(model, newdata = X_test))
+
+    tuning$Alpha[i] <- model$bestTune$alpha
+    tuning$Lambda[i] <- model$bestTune$lambda
+  }
+
+  loocv_tuning[[model_name]] <- tuning
+}
+
+# Confirm all predictions are available
+stopifnot(
+  all(sapply(loocv_predictions, function(x) !anyNA(x)))
+)
+
+table(loocv_tuning[["Gene expression"]]$Lambda)
+table(loocv_tuning[["Gene expression"]]$Alpha)
 ```
 
-##### hyper parameters
-
 ```{r}
-# Hyperparameters across all 29 LOOCV iterations
-loocv_tuning[["Gene expression"]]
+# Evaluate on the LOG-TRANSFORMED outcome scale
+evaluate_loocv <- function(predicted) {
 
-# Summary of selected lambda values
-table(
-  loocv_tuning[["Gene expression"]]$Lambda
+  rmse <- sqrt(mean((y_log - predicted)^2))
+
+  c(
+    RMSE = rmse,
+    R2 = 1 -
+      sum((y_log - predicted)^2) /
+      sum((y_log - mean(y_log))^2),
+    Standardized_RMSE = rmse / sd(y_log)
+  )
+}
+
+loocv_results <- do.call(
+  rbind,
+  lapply(loocv_predictions, evaluate_loocv)
 )
-```
 
-```{r}
-cv_table <- flextable(cv_comparison) %>%
-  colformat_num(
-    j = c("RMSE", "R2", "Standardized_RMSE"),
-    digits = 3
-  ) %>%
-  autofit()
-
-save_as_docx(
-  "Sensitivity analysis: Cross-validation strategy" = cv_table,
-  path = here("output", "sensitivity_loocv.docx")
+loocv_results <- data.frame(
+  Model = names(loocv_predictions),
+  loocv_results,
+  row.names = NULL
 )
+
+loocv_results
 ```
