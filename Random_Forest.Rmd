@@ -40,23 +40,22 @@ expressed_genes <- names(gene_totals[gene_totals > 0])
 
 ```{r}
 # Outcome
-Y <- analysis_tpm$plasmablast_frequency
+Y <- analysis_tpm$pf_d7
 
+# Gene predictors
 X_genes <- as.matrix(analysis_tpm[, expressed_genes, drop = FALSE])
 ```
 
-Running rf at this stage failed due to the huge number of genes. 
+Running rf at this stage crashed due to the huge number of genes. 
 Let's select the top 500 most variable genes within training folds as an exploratory starting point. 
 
 ```{r}
 select_top_genes <- function(X, n_genes = 500) {
-
   gene_variance <- apply(X, 2, var)
-
+  
   gene_variance <- gene_variance[
-    is.finite(gene_variance) & gene_variance > 0
-  ]
-
+    is.finite(gene_variance) & gene_variance > 0]
+  
   selected_genes <- names(
     sort(gene_variance, decreasing = TRUE)
   )[seq_len(min(n_genes, length(gene_variance)))]
@@ -158,16 +157,13 @@ for (i in seq_along(Y)) {
   # Select genes using all 28 outer training participants
   selected_genes <- select_top_genes(
     X_train,
-    n_genes = 500
-  )
+    n_genes = 500)
 
   X_train_selected <- X_train[
-    , selected_genes, drop = FALSE
-  ]
+    , selected_genes, drop = FALSE]
 
   X_test_selected <- X_test[
-    , selected_genes, drop = FALSE
-  ]
+    , selected_genes, drop = FALSE ]
 
   # Fit final outer model
   rf_final <- randomForest(
@@ -237,11 +233,10 @@ Compared with the baseline RMSE of 0.0079, Random Forest has improved predictive
 ```{r} 
 # Log-transform Day 7 plasmablast frequency
 y_log <- log(Y)
-
 summary(y_log)
 ```
 
-## Model
+## Modelling RF on the log transformed
 
 ```{r}
 # Store predictions
@@ -288,36 +283,30 @@ for (i in seq_along(y_log)) {
       # Select genes using inner training participants only
       selected_genes <- select_top_genes(
         X_inner_train,
-        n_genes = 500
-      )
+        n_genes = 500)
 
       X_inner_train_selected <- X_inner_train[
-        , selected_genes, drop = FALSE
-      ]
+        , selected_genes, drop = FALSE]
 
       X_inner_val_selected <- X_inner_val[
-        , selected_genes, drop = FALSE
-      ]
+        , selected_genes, drop = FALSE]
 
       # Fit Random Forest
       log_rf_model <- randomForest(
         x = X_inner_train_selected,
         y = y_inner_train,
         ntree = 500,
-        mtry = min(rf_grid[j], length(selected_genes))
-      )
+        mtry = min(rf_grid[j], length(selected_genes)))
 
       # Predict held-out inner participant
       inner_predictions[k] <- predict(
         log_rf_model,
-        newdata = X_inner_val_selected
-      )
+        newdata = X_inner_val_selected)
     }
 
     # Inner LOOCV RMSE
     inner_rmse[j] <- sqrt(
-      mean((y_train - inner_predictions)^2)
-    )
+      mean((y_train - inner_predictions)^2))
   }
 
   # Select best mtry
@@ -328,16 +317,13 @@ for (i in seq_along(y_log)) {
   # Select genes using all 28 outer training participants
   selected_genes <- select_top_genes(
     X_train,
-    n_genes = 500
-  )
+    n_genes = 500)
 
   X_train_selected <- X_train[
-    , selected_genes, drop = FALSE
-  ]
+    , selected_genes, drop = FALSE]
 
   X_test_selected <- X_test[
-    , selected_genes, drop = FALSE
-  ]
+    , selected_genes, drop = FALSE]
 
   # Fit final outer model
   log_rf_final <- randomForest(
@@ -345,14 +331,12 @@ for (i in seq_along(y_log)) {
     y = y_train,
     ntree = 1000,
     mtry = min(log_best_mtry, length(selected_genes)),
-    importance = TRUE
-  )
+    importance = TRUE)
 
   # Predict held-out participant
   log_rf_predictions[i] <- predict(
     log_rf_final,
-    newdata = X_test_selected
-  )
+    newdata = X_test_selected)
 
   # Baseline prediction
   log_rf_baseline_predictions[i] <- mean(y_train)
@@ -401,7 +385,7 @@ data.frame(
 )
 ```
 
-## Performance calculation on the original scale
+## Performance calculation of the log-based RF on the original scale
 
 ```{r}
 # Back-transform Random Forest predictions
@@ -413,7 +397,7 @@ log_rf_baseline_predictions_original <- exp(
 )
 ```
 
-##  Model compoarison
+##  Model comparison
 ```{r}
 # Create comparison table
 
@@ -429,7 +413,6 @@ model_comparison <- data.frame(
   ),
 
   RMSE = c(
-
     # Original Random Forest
     rf_rmse,
 
@@ -482,9 +465,9 @@ write.csv(
   row.names = TRUE
 )
 ```
- This suggests that the log transformation did not improve the predictive performance of your Random Forest due to lower RMSE at the original scale.
+ This suggests that the log transformation did not improve the predictive performance of the Random Forest due to lower RMSE at the original scale.
  
- Further analysis will however use the log transform outcome due to the skewness of the original data
+ Further analysis will however use the log transform outcome due to the skewness of the original data. 
  
 ## Additional analysis
 ```{r}
@@ -492,19 +475,17 @@ write.csv(
 clinical_data <- data.frame(
   age = analysis_tpm$age,
   sex = factor(analysis_tpm$biological_sex),
-  vaccination = analysis_tpm$n_prior_vax
-)
+  vaccination = analysis_tpm$n_prior_vax)
 ```
 
-For vaccination history, data is missing for two participants. They currentyl have analysis_tpm$n_prior_vax = 0. Performing median imputation rather than removing them. 
+For vaccination history, data is missing for two participants. They currently have analysis_tpm$n_prior_vax = 0. Performing median imputation rather than removing them due to small sample size. 
 
 ```{r}
 impute_median <- function(train, test, variable) {
 
 median_value <- median(
     train[[variable]][train[[variable]] != 0],
-    na.rm = TRUE
-  )
+    na.rm = TRUE)
 
   train[[variable]][train[[variable]] == 0] <- median_value
   test[[variable]][test[[variable]] == 0] <- median_value
@@ -512,6 +493,8 @@ median_value <- median(
   list(train = train, test = test)
 }
 ```
+
+### RF modelling while including clinical and demographics variables
 
 ```{r}
 run_nested_rf <- function(clinical_vars = character(0)) {
@@ -551,8 +534,7 @@ if ("vaccination" %in% clinical_vars) {
   imputed <- impute_median(
     clinical_train,
     clinical_test,
-    "vaccination"
-  )
+    "vaccination")
 
   clinical_train <- imputed$train
   clinical_test <- imputed$test
@@ -711,11 +693,11 @@ rf_importance[[i]] <- data.frame(
 }
 ```
 
-## Running the three models
+### Running the three models
 
 Model 1: Genes only
 Model 2: Genes + age + sex
-Model 3: Genes + age + sex + previous_vax
+Model 3: Genes + age + sex + vaccination history
 
 ```{r}
 # Model 1: Genes only
@@ -785,6 +767,64 @@ write.csv(
   row.names = TRUE
 )
 ```
-The full model is actually performing very slightly better than the baseline, although the difference is extremely small.
+The full model is notperforming better than the baseline, although better than the ones without vaccination histories.
 
-However, the negative R² indicates that the model still performs worse than simply predicting the overall mean of the observed outcome.
+## Final output table
+
+Combining all RF models into a table to use in the report. 
+
+```{r}
+## Combined model comparison
+
+model_comparison <- rbind(
+
+  # Original Random Forest
+  Original_RF = calculate_metrics(Y, rf_predictions),
+
+  Original_Baseline = calculate_metrics(Y, rf_baseline_predictions),
+
+  # Log Random Forest models (log scale)
+  Log_RF_Genes = calculate_metrics(
+    y_log, rf_model_genes$predictions
+  ),
+
+  Log_RF_Genes_Age_Sex = calculate_metrics(
+    y_log, rf_model_demo$predictions
+  ),
+
+  Log_RF_Genes_Age_Sex_Vaccination = calculate_metrics(
+    y_log, rf_model_full$predictions
+  ),
+
+  Log_Baseline = calculate_metrics(
+    y_log, rf_model_genes$baseline_predictions
+  ),
+
+  # Log Random Forest (back-transformed to original scale)
+  Log_RF_Original_Scale = calculate_metrics(
+    Y, log_rf_predictions_original
+  ),
+
+  Log_Baseline_Original_Scale = calculate_metrics(
+    Y, log_rf_baseline_predictions_original
+  )
+)
+
+# Convert row names into a Model column
+model_comparison <- data.frame(
+  Model = rownames(model_comparison),
+  model_comparison,
+  row.names = NULL
+)
+
+# Display
+model_comparison
+
+# Export
+write.csv(
+  model_comparison,
+  here("output", "rf_model_comparison.csv"),
+  row.names = FALSE
+)
+```
+

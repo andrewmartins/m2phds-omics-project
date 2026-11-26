@@ -1,0 +1,2731 @@
+---
+title: "Influenza project — limma-voom association analysis"
+author: "M2 PHDS — Group 2"
+format: html
+editor: source
+format:
+  html:
+    toc: true
+    toc-depth: 2
+execute:
+  echo: true
+  warning: true
+  message: false
+---
+
+# What we are testing??
+
+We want to identify which day 0 PBMC genes are associated with day 7 ASC frequency after influenza vaccination. We're looking at associations rather than prediction, keeping ASC continuous as Arthur suggested. Limma results won't be used for feature selection in elastic net.
+
+We'll include all 29 participants in the main analysis. Two have missing vaccination histories, so we'll replace those values with the median number of prior vaccinations among the other 27 participants. We'll also run sensitivity analyses to see whether different approaches to missing data affect the results.
+
+For limma voom, we'll use the raw gene counts already prepared by the group, followed by TMM normalization and voom
+
+# 1. Packages and existing data
+
+```{r}
+# Check that statmod is installed (needed for robust eBayes)
+if (!requireNamespace("statmod", quietly = TRUE)) {
+  stop("Install statmod first: install.packages('statmod')")
+}
+
+# Folder for our limma results
+out_dir <- here::here("output", "limma_voom")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Load the datasets already prepared by the group
+analysis_counts <- readRDS("data/processed/analysis_counts.rds")
+meta <- readRDS("data/processed/analysis_metadata.rds")
+vaccine_hist <- readRDS("data/vaccine_hist.rds")
+
+# Make sure participants are in the same order
+meta <- meta[match(analysis_counts$participant_id, meta$participant_id), ]
+
+stopifnot(
+  !anyNA(meta$participant_id),
+  identical(analysis_counts$participant_id, meta$participant_id)
+)
+
+# Convert RNA-seq data into a matrix for limma
+# We need genes in rows and participants in columns
+gene_cols <- grep("^ENSG", names(analysis_counts), value = TRUE)
+
+counts <- t(as.matrix(analysis_counts[, gene_cols]))
+storage.mode(counts) <- "numeric"
+
+colnames(counts) <- meta$participant_id
+
+# Quick checks
+cat("Participants:", ncol(counts), "\n")
+cat("Genes before filtering:", nrow(counts), "\n")
+
+```
+
+# 2. Vaccination-history —imp. correction
+
+```{r}
+
+# Started with the original metadata so we can rerun this section
+# without adding the same columns multiple times
+meta <- readRDS("data/processed/analysis_metadata.rds")
+
+# Keep participants in the same order as the RNA-seq data
+meta <- meta[match(analysis_counts$participant_id,
+                   meta$participant_id), ]
+
+stopifnot(
+  !anyNA(meta$participant_id),
+  identical(as.character(meta$participant_id),
+            as.character(analysis_counts$participant_id))
+)
+
+# Checked that the vaccination-history data has everything we need
+stopifnot(
+  all(c("subject", "vaccine_year", "received") %in% names(vaccine_hist))
+)
+# Made sure vaccination years are stored as numbers
+vaccine_hist <- vaccine_hist %>%
+  mutate(
+    vaccine_year = as.integer(as.character(vaccine_year)),
+    received = as.character(received)
+  )
+
+# Checked for missing years and duplicated yearly records
+duplicates <- vaccine_hist %>%
+  count(subject, vaccine_year) %>%
+  filter(n > 1)
+
+print(duplicates)
+
+stopifnot(
+  !anyNA(vaccine_hist$vaccine_year),
+  nrow(duplicates) == 0
+)
+
+#Count previous vaccinations for each participant
+# The 2024 study vaccination should not be counted as previous
+vax_summary <- vaccine_hist %>%
+  group_by(subject) %>%
+  summarise(
+    n_prior_corrected = sum(
+      vaccine_year < 2024 &
+      received %in% c("Yes_Study", "Yes_selfReported")
+    ),
+
+    #Check how many 2024 study vaccinations were recorded
+    n_study_vax = sum(
+      vaccine_year == 2024 & received == "Yes_Study"
+    ),
+
+    .groups = "drop"
+  )
+
+# Add the corrected history to our participant data
+meta <- meta %>%
+  left_join(vax_summary, by = "subject") %>%
+  mutate(
+    # No vaccination records means unknown, not zero
+    vax_missing = is.na(n_prior_corrected),
+
+    # Median imputation for the two missing histories
+    n_prior_imputed = if_else(
+      vax_missing,
+      median(n_prior_corrected, na.rm = TRUE),
+      as.numeric(n_prior_corrected)
+    ),
+
+    # Alternative assumption for sensitivity analysis only
+    n_prior_zero = coalesce(n_prior_corrected, 0)
+  )
+
+# Check that we still have one row per participant
+stopifnot(
+  nrow(meta) == nrow(analysis_counts),
+  !anyDuplicated(meta$participant_id)
+)
+
+# Compared the original count with our corrected count
+# We expect a difference of 1 if the old count included 2024
+cat("Difference between original and corrected counts:\n")
+print(table(
+  meta$n_prior_vax - meta$n_prior_corrected,
+  useNA = "ifany"
+))
+
+# Check missing vaccination histories
+cat("\nMissing vaccination histories:\n")
+print(table(meta$vax_missing))
+
+# Check the corrected counts
+cat("\nCorrected prior vaccination counts:\n")
+print(summary(meta$n_prior_corrected))
+
+cat("\nMedian prior vaccinations:\n")
+print(median(meta$n_prior_corrected, na.rm = TRUE))
+
+# Check how many study vaccinations were recorded in 2024
+cat("\n2024 study vaccination records:\n")
+print(table(meta$n_study_vax, useNA = "ifany"))
+
+# Review the final vaccination variables for all participants
+vax_audit <- meta %>%
+  select(
+    participant_id, age, n_prior_vax,
+    n_study_vax, n_prior_corrected,
+    vax_missing, n_prior_imputed, n_prior_zero
+  )
+
+print(as.data.frame(vax_audit))
+# Save the audit for the report appendix
+write_csv(
+  vax_audit,
+  file.path(out_dir, "01_vaccination_history_audit.csv")
+)
+
+```
+
+# 3. Outcome and model checks
+
+```{r}
+
+# Prepared variables for limma
+meta <- meta %>%
+  mutate(
+    age = as.numeric(age),
+    biological_sex = factor(biological_sex),
+    ASC_day7 = as.numeric(pf_d7),
+    log_ASC7 = log(ASC_day7),
+    age_c = age - mean(age),
+    ASC7_sd = as.numeric(scale(ASC_day7))
+  )
+
+# Checked for missing or invalid values
+stopifnot(
+  nrow(meta) == 29,
+  all(is.finite(meta$ASC_day7)),
+  all(meta$ASC_day7 > 0),
+  !anyNA(meta$age),
+  !anyNA(meta$biological_sex),
+  !anyNA(meta$n_prior_imputed)
+)
+
+# Checked the outcome and covariates
+summary(meta$ASC_day7)
+table(meta$biological_sex)
+table(meta$vax_missing)
+
+# Checked whether age and previous vaccinations are related
+known <- meta %>% filter(!vax_missing)
+
+cor.test(
+  known$age,
+  known$n_prior_corrected,
+  method = "spearman",
+  exact = FALSE
+)
+
+# Compared the original and log-transformed ASC distributions
+asc_long <- meta %>%
+  select(ASC_day7, log_ASC7) %>%
+  pivot_longer(
+    everything(),
+    names_to = "scale",
+    values_to = "value"
+  )
+
+p_asc <- ggplot(asc_long, aes(x = value)) +
+  geom_histogram(bins = 12, fill = "steelblue", colour = "white") +
+  facet_wrap(~scale, scales = "free_x") +
+  labs(
+    title = "Day 7 ASC: original vs log-transformed",
+    x = "ASC frequency",
+    y = "Participants"
+  ) +
+  theme_minimal()
+
+print(p_asc)
+
+ggsave(
+  file.path(out_dir, "appendix_ASC_original_vs_log.png"),
+  p_asc, width = 8, height = 4, dpi = 300
+)
+
+```
+
+# 4. Filter genes once and prepare the count data
+
+```{r}
+# Removed genes with insufficient expression across participants
+# Filtering is based on RNA-seq counts, not day 7 ASC
+dge <- DGEList(counts = counts)
+
+keep <- filterByExpr(
+  dge,
+  group = factor(rep("same_cohort", ncol(counts)))
+)
+
+counts_tested <- counts[keep, , drop = FALSE]
+
+# Check how many genes remain
+cat("Genes before filtering:", nrow(counts), "\n")
+cat("Genes retained:", nrow(counts_tested), "\n")
+cat("Genes removed:", sum(!keep), "\n")
+
+# Checked whether any retained genes have identical counts in all samples
+zero_var <- rowSums(
+  (counts_tested -
+   rowMeans(counts_tested))^2
+) == 0
+
+cat("Zero-variance genes remaining:", sum(zero_var), "\n")
+
+# Saved all tested genes as the background for GO enrichment
+write_lines(
+  rownames(counts_tested),
+  file.path(out_dir, "GO_background_tested_Ensembl.txt")
+)
+
+# Saved a short summary for the report
+filter_summary <- tibble(
+  participants = ncol(counts),
+  genes_before = nrow(counts),
+  genes_tested = nrow(counts_tested),
+  genes_removed = sum(!keep),
+  missing_vax_history = sum(meta$vax_missing),
+  zero_variance_genes = sum(zero_var)
+)
+
+print(filter_summary)
+
+write_csv(
+  filter_summary,
+  file.path(out_dir, "02_filtering_summary.csv")
+)
+
+```
+
+# 5.1. Main limma-voom model
+
+```{r}
+
+# 5. Main limma-voom model
+
+# Run the same limma-voom workflow for different models
+# This will also be useful for our sensitivity analyses
+fit_association <- function(df, formula, asc_term = "log_ASC7",
+                            plot_voom = FALSE) {
+  
+  # Check model variables and match participants to RNA-seq samples
+  stopifnot(!anyNA(df[, all.vars(formula), drop = FALSE]))
+  
+  ids <- match(df$participant_id, colnames(counts_tested))
+  stopifnot(!anyNA(ids), !anyDuplicated(df$participant_id))
+  
+  # Build the regression model
+  design <- model.matrix(formula, data = df)
+  
+  stopifnot(
+    qr(design)$rank == ncol(design),
+    asc_term %in% colnames(design),
+    nrow(design) - ncol(design) >= 8
+  )
+  
+  # TMM normalization, voom weights and gene-wise regression
+  dge <- DGEList(counts = counts_tested[, ids, drop = FALSE])
+  dge <- normLibSizes(dge, method = "TMM")
+  
+  v <- voom(dge, design, plot = plot_voom)
+  
+  fit <- lmFit(v, design)
+  fit <- eBayes(fit, robust = TRUE)
+  
+  # Extract association with ASC and adjust for multiple testing
+  results <- topTable(
+  fit,
+  coef = asc_term,
+  number = Inf,
+  adjust.method = "BH",
+  sort.by = "P"
+) %>%
+    as.data.frame() %>%
+    rownames_to_column("gene_id") %>%
+    rename(beta_ASC = logFC)
+  
+  
+  
+  list(
+    design = design,
+    dge = dge,
+    voom = v,
+    fit = fit,
+    results = results
+  )
+}
+
+# Main model: Day 7 ASC adjusted for age, sex and previous vaccinations
+main_formula <- ~ log_ASC7 + age_c + biological_sex + n_prior_imputed
+
+# Save the voom mean-variance diagnostic plot
+pdf(file.path(out_dir, "appendix_voom_mean_variance.pdf"),
+    width = 8, height = 6)
+
+main <- fit_association(meta, main_formula, plot_voom = TRUE)
+
+dev.off()
+
+# Main results
+res <- main$results
+
+cat("Participants:", nrow(main$design), "\n")
+cat("Model parameters:", ncol(main$design), "\n")
+cat("Residual degrees of freedom:",
+    nrow(main$design) - ncol(main$design), "\n")
+cat("Genes tested:", nrow(res), "\n")
+cat("Nominal p < 0.05:", sum(res$P.Value < 0.05), "\n")
+cat("BH FDR < 0.05:", sum(res$adj.P.Val < 0.05), "\n")
+
+# Show the ten strongest associations
+print(head(res, 10))
+
+# Save complete results
+write_csv(res, file.path(out_dir, "03_limma_main_all_genes.csv"))
+
+# Save significant genes
+significant <- res %>% filter(adj.P.Val < 0.05)
+
+write_csv(
+  significant,
+  file.path(out_dir, "03_limma_main_FDR05.csv")
+)
+
+# Prepare GO analysis inputs
+write_lines(
+  significant$gene_id,
+  file.path(out_dir, "GO_foreground_FDR05_Ensembl.txt")
+)
+
+write_csv(
+  res %>% select(gene_id, beta_ASC, t, P.Value, adj.P.Val),
+  file.path(out_dir, "GO_ranked_genes.csv")
+)
+
+```
+
+Coefficient interpretation: Here `log_ASC7 = ln(ASC)`. The printed `beta_ASC` estimates how much baseline log₂ gene expression differs per one-unit increase in `ln(ASC)`, holding the covariates constant. For a doubling of ASC, the difference in log₂ expression is `beta_ASC * ln(2)`. We should not use a generic `|logFC| > 1` DEG threshold from the categorical practical.
+
+# 5.2. Sensitivity analyses
+
+```{r}
+# Model 1: no vaccination history adjustment
+no_vax <- fit_association(
+  meta,
+  ~ log_ASC7 + age_c + biological_sex
+)
+
+# Model 2: Original ASC scale, standardised for interpretation
+raw_asc <- fit_association(
+  meta,
+  ~ ASC7_sd + age_c + biological_sex + n_prior_imputed,
+  asc_term = "ASC7_sd"
+)
+
+# Model 3: Only participants with documented vaccination histories
+complete <- fit_association(
+  meta %>% filter(!vax_missing),
+  ~ log_ASC7 + age_c + biological_sex + n_prior_corrected
+)
+
+# Model 4: Assume zero previous vaccinations for missing histories
+zero_vax <- fit_association(
+  meta,
+  ~ log_ASC7 + age_c + biological_sex + n_prior_zero
+)
+
+# Compared results across all models
+models <- list(
+  Primary = main,
+  No_vaccination_adjustment = no_vax,
+  Original_ASC_scale = raw_asc,
+  Complete_cases = complete,
+  Zero_imputation = zero_vax
+)
+
+comparison <- bind_rows(lapply(names(models), function(name) {
+  x <- models[[name]]
+
+  tibble(
+    model = name,
+    participants = nrow(x$design),
+    nominal_p05 = sum(x$results$P.Value < 0.05),
+    FDR_05 = sum(x$results$adj.P.Val < 0.05),
+    FDR_10 = sum(x$results$adj.P.Val < 0.10),
+    minimum_FDR = min(x$results$adj.P.Val)
+  )
+}))
+
+print(comparison)
+
+# Saved comparison for the report
+write_csv(
+  comparison,
+  file.path(out_dir, "04_model_sensitivity_comparison.csv")
+)
+
+```
+
+#6. Diagnostic checks #6.1. P-value distributions
+
+```{r}
+p_data <- bind_rows(
+  tibble(model = "Log ASC", p = main$results$P.Value),
+  tibble(model = "Original ASC", p = raw_asc$results$P.Value)
+)
+
+# Histogram: are small p-values unusually common?
+p_hist <- ggplot(p_data, aes(x = p)) +
+  geom_histogram(bins = 40, fill = "steelblue", colour = "white") +
+  facet_wrap(~model) +
+  labs(
+    title = "Distribution of gene-wise p-values",
+    x = "Unadjusted p-value",
+    y = "Number of genes"
+  ) +
+  theme_minimal()
+
+print(p_hist)
+
+ggsave(
+  file.path(out_dir, "07_pvalue_distributions.png"),
+  p_hist, width = 9, height = 4, dpi = 300
+)
+
+# QQ plot: compare observed p-values with a uniform null distribution
+p_qq <- p_data %>%
+  group_by(model) %>%
+  arrange(p, .by_group = TRUE) %>%
+  mutate(
+    expected = -log10(ppoints(n())),
+    observed = -log10(pmax(p, .Machine$double.xmin))
+  )
+
+p_qq_plot <- ggplot(p_qq, aes(expected, observed)) +
+  geom_point(size = 0.7, alpha = 0.4, colour = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~model) +
+  coord_equal() +
+  labs(
+    title = "QQ plots of gene-wise p-values",
+    x = "Expected -log10(p)",
+    y = "Observed -log10(p)"
+  ) +
+  theme_minimal()
+
+print(p_qq_plot)
+
+ggsave(
+  file.path(out_dir, "07_pvalue_QQ.png"),
+  p_qq_plot, width = 9, height = 5, dpi = 300
+)
+
+```
+
+#6.2. Gene-level diagnostics
+
+```{r}
+# Looked at top genes from both models
+diagnostic_genes <- unique(c(
+  head(raw_asc$results$gene_id, 3),
+  head(main$results$gene_id, 3)
+))
+
+#Used the same genes for both models
+diagnostic_models <- list(
+  "Original ASC" = list(
+    model = raw_asc,
+    formula = ~ ASC7_sd + age_c + biological_sex + n_prior_imputed,
+    term = "ASC7_sd"
+  ),
+  "Log ASC" = list(
+    model = main,
+    formula = ~ log_ASC7 + age_c + biological_sex + n_prior_imputed,
+    term = "log_ASC7"
+  )
+)
+
+diagnostics <- list()
+associations <- list()
+
+for (model_name in names(diagnostic_models)) {
+
+  spec <- diagnostic_models[[model_name]]
+
+  for (gene in diagnostic_genes) {
+
+    # Voom-normalized gene expression and its precision weights
+    df <- meta
+    df$expression <- as.numeric(spec$model$voom$E[gene, ])
+    w <- as.numeric(
+  spec$model$voom$weights[
+    match(gene, rownames(spec$model$voom$E)), 
+  ]
+)
+
+    # Fitted this gene separately to obtain standard regression diagnostics
+    gene_fit <- lm(
+      update(spec$formula, expression ~ .),
+      data = df,
+      weights = w
+    )
+
+    #Saved residuals, fitted values and influence measures
+    diagnostics[[length(diagnostics) + 1]] <- tibble(
+      model = model_name,
+      gene_id = gene,
+      participant_id = df$participant_id,
+      fitted = fitted(gene_fit),
+      residual = rstandard(gene_fit),
+      cooks_d = cooks.distance(gene_fit)
+    )
+
+    # Removed the estimated age, sex and vaccination contributions
+    #This shows the ASC association after adjustment
+    design <- model.matrix(spec$formula, df)
+    beta <- coef(gene_fit)
+
+    covariates <- setdiff(
+      colnames(design),
+      c("(Intercept)", spec$term)
+    )
+
+    adjusted_y <- df$expression -
+      as.vector(
+        design[, covariates, drop = FALSE] %*% beta[covariates]
+      )
+
+    associations[[length(associations) + 1]] <- tibble(
+      model = model_name,
+      gene_id = gene,
+      ASC = df[[spec$term]],
+      expression = adjusted_y,
+      intercept = unname(beta["(Intercept)"]),
+      slope = unname(beta[spec$term])
+    )
+  }
+}
+
+diagnostics <- bind_rows(diagnostics)
+associations <- bind_rows(associations)
+
+# Plot adjusted gene-expression associations
+p_association <- ggplot(
+  associations,
+  aes(x = ASC, y = expression)
+) +
+  geom_point(colour = "steelblue", alpha = 0.8) +
+  geom_abline(
+    aes(intercept = intercept, slope = slope),
+    colour = "firebrick"
+  ) +
+  facet_grid(model ~ gene_id, scales = "free") +
+  labs(
+    title = "ASC associations adjusted for age, sex and vaccination",
+    x = "ASC predictor (model-specific scale)",
+    y = "Adjusted baseline log2 expression"
+  ) +
+  theme_minimal()
+
+print(p_association)
+
+ggsave(
+  file.path(out_dir, "07_adjusted_gene_associations.png"),
+  p_association, width = 14, height = 7, dpi = 300
+)
+
+# Weighted standardized residuals versus fitted values
+p_resid <- ggplot(diagnostics, aes(fitted, residual)) +
+  geom_point(colour = "steelblue", alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "loess", se = FALSE, colour = "firebrick") +
+  facet_grid(model ~ gene_id, scales = "free_x") +
+  labs(
+    title = "Weighted residuals versus fitted expression",
+    x = "Fitted log2 expression",
+    y = "Standardized residual"
+  ) +
+  theme_minimal()
+
+print(p_resid)
+
+ggsave(
+  file.path(out_dir, "07_residuals_vs_fitted.png"),
+  p_resid, width = 14, height = 7, dpi = 300
+)
+
+# Residual QQ plots
+p_resid_qq <- ggplot(diagnostics, aes(sample = residual)) +
+  stat_qq(colour = "steelblue", alpha = 0.7) +
+  stat_qq_line(colour = "firebrick") +
+  facet_grid(model ~ gene_id) +
+  labs(
+    title = "QQ plots of standardized weighted residuals"
+  ) +
+  theme_minimal()
+
+print(p_resid_qq)
+
+ggsave(
+  file.path(out_dir, "07_residual_QQ.png"),
+  p_resid_qq, width = 14, height = 7, dpi = 300
+)
+
+# Cook's distance: flag potentially influential participants
+# 4/n is a screening guideline, not an automatic exclusion rule
+cook_threshold <- 4 / nrow(meta)
+
+influential <- diagnostics %>%
+  filter(cooks_d > cook_threshold) %>%
+  arrange(desc(cooks_d))
+
+print(influential)
+
+write_csv(
+  influential,
+  file.path(out_dir, "07_influential_observations.csv")
+)
+
+p_cooks <- ggplot(
+  diagnostics,
+  aes(x = participant_id, y = cooks_d)
+) +
+  geom_col(fill = "steelblue") +
+  geom_hline(
+    yintercept = cook_threshold,
+    linetype = "dashed",
+    colour = "firebrick"
+  ) +
+  facet_grid(model ~ gene_id, scales = "free_y") +
+  labs(
+    title = "Cook's distance by participant",
+    x = "Participant",
+    y = "Cook's distance"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, size = 5))
+
+print(p_cooks)
+
+ggsave(
+  file.path(out_dir, "07_cooks_distance.png"),
+  p_cooks, width = 14, height = 8, dpi = 300
+)
+
+loo_summary %>%
+  arrange(genes_FDR05) %>%
+  select(removed_participant, genes_FDR05, original_genes_retained) %>%
+  print(n = 29)
+```
+
+#6.3. Leave-one-out sensitivity analysis
+
+```{r}
+# The 78 genes significant in the full original-ASC model
+original_sig <- raw_asc$results$gene_id[
+  raw_asc$results$adj.P.Val < 0.05
+]
+
+# Track the ten strongest genes in more detail
+top_genes <- head(raw_asc$results$gene_id, 10)
+
+loo_results <- list()
+loo_summary <- list()
+
+for (i in seq_len(nrow(meta))) {
+
+  # Remove one participant
+  df_loo <- meta[-i, , drop = FALSE]
+
+  # Refit the original ASC model
+  loo_fit <- fit_association(
+    df_loo,
+    ~ ASC7_sd + age_c + biological_sex + n_prior_imputed,
+    asc_term = "ASC7_sd"
+  )
+
+  r <- loo_fit$results
+
+  # How many associations remain significant?
+  loo_summary[[i]] <- tibble(
+    removed_participant = meta$participant_id[i],
+    genes_FDR05 = sum(r$adj.P.Val < 0.05),
+    original_genes_retained = sum(
+      original_sig %in% r$gene_id[r$adj.P.Val < 0.05]
+    )
+  )
+
+  # Record coefficients and significance for the top ten genes
+  selected <- r[match(top_genes, r$gene_id), ]
+
+  loo_results[[i]] <- tibble(
+    removed_participant = meta$participant_id[i],
+    gene_id = selected$gene_id,
+    beta = selected$beta_ASC,
+    p_value = selected$P.Value,
+    FDR = selected$adj.P.Val
+  )
+}
+
+loo_summary <- bind_rows(loo_summary)
+loo_results <- bind_rows(loo_results)
+
+# Compare the strongest genes with their full-data estimates
+full_top <- raw_asc$results %>%
+  filter(gene_id %in% top_genes) %>%
+  select(gene_id, full_beta = beta_ASC)
+
+gene_stability <- loo_results %>%
+  left_join(full_top, by = "gene_id") %>%
+  group_by(gene_id) %>%
+  summarise(
+    full_beta = first(full_beta),
+    min_beta = min(beta),
+    max_beta = max(beta),
+    same_direction = sum(sign(beta) == sign(full_beta)),
+    FDR05_runs = sum(FDR < 0.05),
+    .groups = "drop"
+  )
+
+cat("Leave-one-out significance summary:\n")
+print(summary(loo_summary$genes_FDR05))
+
+cat("\nNumber of original significant genes retained:\n")
+print(summary(loo_summary$original_genes_retained))
+
+cat("\nStability of top ten genes:\n")
+print(gene_stability)
+
+# Visualise how many significant genes remain
+p_loo <- ggplot(
+  loo_summary,
+  aes(x = reorder(removed_participant, genes_FDR05),
+      y = genes_FDR05)
+) +
+  geom_col(fill = "steelblue") +
+  geom_hline(
+    yintercept = length(original_sig),
+    linetype = "dashed",
+    colour = "firebrick"
+  ) +
+  coord_flip() +
+  labs(
+    title = "Leave-one-out stability: original ASC model",
+    subtitle = "Dashed line = significant genes in the full model",
+    x = "Excluded participant",
+    y = "Genes with FDR < 0.05"
+  ) +
+  theme_minimal()
+
+print(p_loo)
+
+ggsave(
+  file.path(out_dir, "07_leave_one_out.png"),
+  p_loo, width = 8, height = 7, dpi = 300
+)
+
+# Save the results
+write_csv(
+  loo_summary,
+  file.path(out_dir, "07_LOO_summary.csv")
+)
+
+write_csv(
+  gene_stability,
+  file.path(out_dir, "07_LOO_gene_stability.csv")
+)
+
+write_csv(
+  loo_results,
+  file.path(out_dir, "07_LOO_gene_details.csv")
+)
+```
+
+# 7.1. Library sizes and TMM normalization
+
+```{r}
+# Made sure the RNA-seq samples and metadata are aligned
+stopifnot(
+  identical(colnames(main$dge$counts),
+            as.character(meta$participant_id))
+)
+
+# Participants identified as influential in our earlier diagnostics
+focus_ids <- c("ID_335", "ID_438", "ID_594",
+               "ID_600", "ID_296")
+
+# Extracted sequencing information from the fitted model
+sample_qc <- tibble(
+  participant_id = colnames(main$dge$counts),
+  library_size = main$dge$samples$lib.size,
+  TMM_factor = main$dge$samples$norm.factors,
+  effective_library_size = library_size * TMM_factor,
+  ASC_day7 = meta$ASC_day7,
+  age = meta$age
+) %>%
+  mutate(
+    short_id = sub(".*ID_", "ID_", participant_id),
+    influential = short_id %in% focus_ids,
+    library_millions = library_size / 1e6
+  )
+
+# Summarised sequencing characteristics
+print(summary(sample_qc %>%
+  select(library_size, TMM_factor, effective_library_size)))
+
+# Inspected the four participants in particular
+print(sample_qc %>%
+  filter(influential) %>%
+  select(short_id, library_millions, TMM_factor,
+         ASC_day7, age))
+
+# Compared library sizes and TMM factors across participants
+qc_long <- sample_qc %>%
+  select(short_id, influential, library_millions, TMM_factor) %>%
+  pivot_longer(
+    c(library_millions, TMM_factor),
+    names_to = "measure",
+    values_to = "value"
+  )
+
+p_qc <- ggplot(qc_long, aes(x = reorder(short_id, value),
+                            y = value, colour = influential)) +
+  geom_point(size = 2.5) +
+  geom_text(
+    data = filter(qc_long, influential),
+    aes(label = short_id),
+    hjust = -0.15, size = 3, show.legend = FALSE
+  ) +
+  coord_flip() +
+  facet_wrap(~measure, scales = "free_y") +
+  scale_colour_manual(
+    values = c("FALSE" = "grey60", "TRUE" = "firebrick"),
+    labels = c("FALSE" = "Other", "TRUE" = "Previously influential")
+  ) +
+  labs(
+    title = "RNA-seq library sizes and TMM factors",
+    x = "Participant",
+    y = "Value",
+    colour = "Participant"
+  ) +
+  theme_minimal()
+
+print(p_qc)
+
+ggsave(
+  file.path(out_dir, "07_library_sizes_TMM.png"),
+  p_qc, width = 11, height = 7, dpi = 300
+)
+
+write_csv(
+  sample_qc,
+  file.path(out_dir, "07_sample_quality_check.csv")
+)
+```
+
+# 7.2. Expression distributions before and after TMM
+
+```{r}
+#Same filtered genes and samples, without TMM adjustment
+raw_dge <- DGEList(counts = main$dge$counts)
+
+before <- cpm(raw_dge, log = TRUE, prior.count = 2)
+
+#same genes after TMM adjustment
+after <- cpm(main$dge, log = TRUE, prior.count = 2)
+
+# Compared sample distributions
+pdf(
+  file.path(out_dir, "07_expression_before_after_TMM.pdf"),
+  width = 10, height = 7
+)
+
+par(mfrow = c(2, 1), mar = c(3, 4, 3, 1))
+
+boxplot(
+  before, outline = FALSE, xaxt = "n",
+  main = "Before TMM normalization",
+  ylab = "log2-CPM"
+)
+
+boxplot(
+  after, outline = FALSE, xaxt = "n",
+  main = "After TMM normalization",
+  ylab = "log2-CPM"
+)
+
+dev.off()
+
+par(mfrow = c(2, 1))
+
+boxplot(before, outline = FALSE,
+        main = "Before TMM", ylab = "log2-CPM")
+
+boxplot(after, outline = FALSE,
+        main = "After TMM", ylab = "log2-CPM")
+
+par(mfrow = c(1, 1))
+```
+
+# 7.3. MDS: check overall expression patterns
+
+```{r}
+# Calculated distances between RNA-seq samples
+mds <- plotMDS(main$voom$E, plot = FALSE)
+
+# added the coordinates to our existing sample QC table
+mds_data <- sample_qc %>%
+  mutate(
+    MDS1 = mds$x,
+    MDS2 = mds$y
+  )
+
+# Highlight 5 influential participants
+p_mds <- ggplot(mds_data, aes(MDS1, MDS2)) +
+  geom_point(aes(colour = influential), size = 3) +
+  geom_text(
+    data = filter(mds_data, influential),
+    aes(label = short_id),
+    vjust = -0.8,
+    size = 3
+  ) +
+  scale_colour_manual(
+    values = c("FALSE" = "grey60", "TRUE" = "firebrick")
+  ) +
+  labs(
+    title = "MDS of baseline RNA-seq samples",
+    x = "MDS dimension 1",
+    y = "MDS dimension 2",
+    colour = "Influential participant"
+  ) +
+  theme_minimal()
+
+print(p_mds)
+
+ggsave(
+  file.path(out_dir, "07_MDS_samples.png"),
+  p_mds, width = 8, height = 6, dpi = 300
+)
+
+write_csv(
+  mds_data,
+  file.path(out_dir, "07_MDS_coordinates.csv")
+)
+```
+
+# 7.4. ASC values and influential participants
+
+```{r}
+# Compared ASC across participants
+p_asc <- ggplot(sample_qc, aes(age, ASC_day7)) +
+  geom_point(aes(colour = influential), size = 3) +
+  geom_text(
+    data = filter(sample_qc, influential),
+    aes(label = short_id),
+    vjust = -0.8,
+    size = 3
+  ) +
+  scale_colour_manual(
+    values = c("FALSE" = "grey60", "TRUE" = "firebrick")
+  ) +
+  labs(
+    title = "Day 7 ASC by age",
+    x = "Age (years)",
+    y = "Day 7 ASC frequency",
+    colour = "Influential participant"
+  ) +
+  theme_minimal()
+
+print(p_asc)
+
+ggsave(
+  file.path(out_dir, "07_ASC_influential_participants.png"),
+  p_asc, width = 8, height = 6, dpi = 300
+)
+
+# Show all participants, ranked by ASC
+print(
+  sample_qc %>%
+    arrange(desc(ASC_day7)) %>%
+    select(short_id, ASC_day7, age, influential),
+  n = 29
+)
+
+```
+
+#7.5. Final model checks
+
+```{r}
+# Modeled structure and age-vaccination correlation
+design_check <- tibble(
+  participants = nrow(main$design),
+  parameters = ncol(main$design),
+  residual_df = nrow(main$design) - ncol(main$design),
+  full_rank = qr(main$design)$rank == ncol(main$design),
+  age_vax_correlation = cor(
+    meta$age,
+    meta$n_prior_imputed,
+    method = "spearman"
+  )
+)
+
+print(design_check)
+
+write_csv(
+  design_check,
+  file.path(out_dir, "07_design_check.csv")
+)
+
+# Checked residual variability against average gene expression
+plotSA(main$fit)
+
+# savde the same plot for the appendix
+pdf(file.path(out_dir, "07_plotSA.pdf"), width = 8, height = 6)
+plotSA(main$fit)
+dev.off()
+```
+
+#8. Comparing original and log-transformed ASC models \# 8.1. Compared model fit using the same voom weights
+
+```{r}
+# Both models used the same 29 participants and 5 parameters
+design_log <- main$design
+design_raw <- model.matrix(
+  ~ ASC7_sd + age_c + biological_sex + n_prior_imputed,
+  data = meta
+)
+
+stopifnot(
+  nrow(design_log) == nrow(design_raw),
+  ncol(design_log) == ncol(design_raw),
+  identical(colnames(main$voom$E), as.character(meta$participant_id))
+)
+
+# Kept expression values and weights identical for a fair comparison
+fit_log <- lmFit(main$voom, design_log)
+fit_raw <- lmFit(main$voom, design_raw)
+
+# Compared weighted residual variation for every gene
+rss_log <- fit_log$sigma^2 * fit_log$df.residual
+rss_raw <- fit_raw$sigma^2 * fit_raw$df.residual
+
+fit_comparison <- tibble(
+  gene_id = rownames(main$voom$E),
+  rss_log = rss_log,
+  rss_raw = rss_raw,
+  log2_rss_ratio = log2(rss_raw / rss_log)
+)
+
+# Negative values meant original ASC fitted better
+cat("Genes fitted better by original ASC:",
+    sum(fit_comparison$log2_rss_ratio < 0), "\n")
+
+cat("Genes fitted better by log ASC:",
+    sum(fit_comparison$log2_rss_ratio > 0), "\n")
+
+cat("Percentage favouring original ASC:",
+    round(mean(fit_comparison$log2_rss_ratio < 0) * 100, 1),
+    "%\n")
+
+print(summary(fit_comparison$log2_rss_ratio))
+
+# Visualised the differences across all tested genes
+p_fit <- ggplot(fit_comparison, aes(log2_rss_ratio)) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Model fit: original vs log-transformed ASC",
+    subtitle = "Negative = original ASC fitted better; positive = log ASC fitted better",
+    x = "log2(weighted RSS original / weighted RSS log)",
+    y = "Number of genes"
+  ) +
+  theme_minimal()
+
+print(p_fit)
+
+ggsave(file.path(out_dir, "08_model_fit_comparison.png"),
+       p_fit, width = 8, height = 5, dpi = 300)
+
+write_csv(fit_comparison,
+          file.path(out_dir, "08_gene_model_fit.csv"))
+```
+
+# 8.2. Compared participant leverage between ASC scales
+
+```{r}
+# Calculated ordinary regression leverage from each design matrix
+get_leverage <- function(design) {
+  rowSums(qr.Q(qr(design))^2)
+}
+
+leverage_data <- tibble(
+  participant_id = meta$participant_id,
+  short_id = sub(".*ID_", "ID_", meta$participant_id),
+  original_ASC = get_leverage(design_raw),
+  log_ASC = get_leverage(design_log)
+) %>%
+  mutate(
+    influential = short_id %in% focus_ids
+  ) %>%
+  pivot_longer(
+    c(original_ASC, log_ASC),
+    names_to = "model",
+    values_to = "leverage"
+  )
+
+# Showed the previously influential participants
+print(
+  leverage_data %>%
+    filter(influential) %>%
+    select(short_id, model, leverage)
+)
+
+# Plotted leverage across both models
+p_leverage <- ggplot(
+  leverage_data,
+  aes(x = reorder(short_id, leverage), y = leverage)
+) +
+  geom_point(aes(colour = influential), size = 2.5) +
+  geom_hline(
+    yintercept = 2 * ncol(design_log) / nrow(design_log),
+    linetype = "dashed"
+  ) +
+  coord_flip() +
+  facet_wrap(~model) +
+  scale_colour_manual(
+    values = c("FALSE" = "grey60", "TRUE" = "firebrick")
+  ) +
+  labs(
+    title = "Participant leverage across ASC transformations",
+    subtitle = "Dashed line = 2 × number of parameters / participants",
+    x = "Participant",
+    y = "Leverage",
+    colour = "Previously influential"
+  ) +
+  theme_minimal()
+
+print(p_leverage)
+
+ggsave(file.path(out_dir, "08_leverage_comparison.png"),
+       p_leverage, width = 10, height = 7, dpi = 300)
+
+write_csv(leverage_data,
+          file.path(out_dir, "08_participant_leverage.csv"))
+```
+
+# 8.3. Compared gene associations between ASC scales
+
+```{r}
+gene_compare <- main$results %>%
+  select(gene_id, beta_log = beta_ASC,
+         t_log = t, p_log = P.Value) %>%
+  inner_join(
+    raw_asc$results %>%
+      select(gene_id, beta_raw = beta_ASC,
+             t_raw = t, p_raw = P.Value,
+             FDR_raw = adj.P.Val),
+    by = "gene_id"
+  )
+
+stopifnot(nrow(gene_compare) == nrow(main$results))
+
+# Compared directions and strength of gene associations
+cat("Same coefficient direction:",
+    round(mean(sign(gene_compare$beta_log) ==
+                 sign(gene_compare$beta_raw)) * 100, 1),
+    "%\n")
+
+cat("Spearman correlation of moderated t-statistics:",
+    round(cor(gene_compare$t_log, gene_compare$t_raw,
+              method = "spearman"), 3), "\n")
+
+# Checked overlap between the 50 strongest genes
+top_log <- head(main$results$gene_id, 50)
+top_raw <- head(raw_asc$results$gene_id, 50)
+
+cat("Top 50 genes shared:",
+    length(intersect(top_log, top_raw)), "/ 50\n")
+
+# Checked whether original-scale significant genes also ranked highly in log ASC
+raw_sig <- gene_compare %>%
+  filter(FDR_raw < 0.05)
+
+cat("Original ASC FDR-significant genes:", nrow(raw_sig), "\n")
+cat("Of those, nominal p < 0.05 under log ASC:",
+    sum(raw_sig$p_log < 0.05), "\n")
+
+# Compared gene-wise moderated t-statistics
+p_genes <- ggplot(gene_compare, aes(t_log, t_raw)) +
+  geom_point(alpha = 0.25, size = 0.7, colour = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Gene association strength across ASC scales",
+    x = "Moderated t-statistic: log ASC",
+    y = "Moderated t-statistic: original ASC"
+  ) +
+  theme_minimal()
+
+print(p_genes)
+
+ggsave(file.path(out_dir, "08_gene_association_comparison.png"),
+       p_genes, width = 7, height = 6, dpi = 300)
+
+write_csv(gene_compare,
+          file.path(out_dir, "08_gene_association_comparison.csv"))
+```
+
+#9. Genome-wide consistency and final checks \# 9.1. Summarised the five models we already fitted
+
+```{r}
+models <- list(
+  Primary = main,
+  No_vaccination = no_vax,
+  Original_ASC = raw_asc,
+  Complete_cases = complete,
+  Zero_imputation = zero_vax
+)
+
+model_summary <- bind_rows(lapply(names(models), function(name) {
+  m <- models[[name]]
+  r <- m$results
+
+  tibble(
+    model = name,
+    participants = nrow(m$design),
+    genes_tested = nrow(r),
+    nominal_p05 = sum(r$P.Value < 0.05),
+    FDR05 = sum(r$adj.P.Val < 0.05),
+    min_FDR = min(r$adj.P.Val)
+  )
+}))
+
+print(model_summary)
+
+write_csv(
+  model_summary,
+  file.path(out_dir, "09_model_summary.csv")
+)
+
+```
+
+# 9.2. Compared all tested genes across models
+
+```{r}
+# Used the initial log(ASC) model as the reference
+reference <- main$results
+
+stopifnot(
+  !anyDuplicated(reference$gene_id),
+  !anyNA(reference$t)
+)
+
+consistency <- bind_rows(lapply(names(models)[-1], function(name) {
+
+  r <- models[[name]]$results
+
+  # Matched the same genes in both models
+  idx <- match(reference$gene_id, r$gene_id)
+
+  stopifnot(
+    !anyNA(idx),
+    !anyDuplicated(r$gene_id),
+    nrow(r) == nrow(reference)
+  )
+
+  r <- r[idx, ]
+
+  tibble(
+    model = name,
+
+    # Agreement in signed association statistics
+    signed_t_correlation = cor(
+      reference$t, r$t, method = "spearman"
+    ),
+
+    # Agreement in overall association strength
+    strength_correlation = cor(
+      abs(reference$t), abs(r$t), method = "spearman"
+    ),
+
+    # Percentage of genes with the same association direction
+    same_direction_pct = 100 * mean(
+      sign(reference$t) == sign(r$t)
+    )
+  )
+}))
+
+print(consistency)
+
+write_csv(
+  consistency,
+  file.path(out_dir, "09_genome_wide_consistency.csv")
+)
+```
+
+# 9.3. Plotted genome-wide agreement without chunky bars
+
+```{r}
+p_consistency <- ggplot(
+  consistency,
+  aes(x = signed_t_correlation,
+      y = reorder(model, signed_t_correlation))
+) +
+  geom_segment(
+    aes(x = 0, xend = signed_t_correlation,
+        yend = model),
+    colour = "grey75",
+    linewidth = 0.6
+  ) +
+  geom_point(size = 3, colour = "steelblue") +
+  geom_text(
+    aes(label = sprintf("%.2f", signed_t_correlation)),
+    hjust = -0.4,
+    size = 3.5
+  ) +
+  scale_x_continuous(
+    limits = c(-1, 1.12),
+    breaks = c(-1, -0.5, 0, 0.5, 1)
+  ) +
+  labs(
+    title = "Gene association consistency",
+    subtitle = "Compared with the initial log(ASC) model",
+    x = "Spearman correlation of moderated t-statistics",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+print(p_consistency)
+
+ggsave(
+  file.path(out_dir, "09_model_consistency.png"),
+  p_consistency, width = 8, height = 3.8, dpi = 300
+)
+```
+
+# 9.4. Prepared all tested genes for annotation and GO
+
+```{r}
+gene_table <- main$results %>%
+  select(
+    gene_id,
+    beta_log = beta_ASC,
+    t_log = t,
+    p_log = P.Value,
+    FDR_log = adj.P.Val
+  ) %>%
+  left_join(
+    raw_asc$results %>%
+      select(
+        gene_id,
+        beta_raw = beta_ASC,
+        t_raw = t,
+        p_raw = P.Value,
+        FDR_raw = adj.P.Val
+      ),
+    by = "gene_id"
+  ) %>%
+  mutate(
+    same_direction = sign(t_log) == sign(t_raw)
+  ) %>%
+  arrange(p_log)
+
+stopifnot(
+  nrow(gene_table) == nrow(main$results),
+  !anyNA(gene_table$t_raw)
+)
+
+print(head(gene_table, 10))
+
+write_csv(
+  gene_table,
+  file.path(out_dir, "09_all_genes_for_annotation.csv")
+)
+
+# Saved the complete tested-gene background
+write_lines(
+  gene_table$gene_id,
+  file.path(out_dir, "GO_background_tested_Ensembl.txt")
+)
+```
+
+# 9.5. Checked our original gene filtering against design-based filtering
+
+```{r}
+dge_check <- DGEList(counts = counts)
+
+# Original filtering: treated everyone as one cohort
+keep_cohort <- filterByExpr(
+  dge_check,
+  group = factor(rep("same_cohort", ncol(counts)))
+)
+
+# Alternative: used our full regression design
+keep_design <- filterByExpr(
+  dge_check,
+  design = main$design
+)
+
+filter_check <- tibble(
+  method = c("Single cohort", "Regression design"),
+  genes_retained = c(sum(keep_cohort), sum(keep_design))
+)
+
+print(filter_check)
+
+cat("Genes kept by both methods:",
+    sum(keep_cohort & keep_design), "\n")
+
+cat("Genes kept only by design-based filtering:",
+    sum(!keep_cohort & keep_design), "\n")
+
+write_csv(
+  filter_check,
+  file.path(out_dir, "09_filtering_audit.csv")
+)
+```
+
+#10. Sensitivity analysis - does gene filtering change our results? \# 10.1. Repeated the primary model with design-based gene filtering
+
+```{r}
+# Started from the original raw counts
+dge_design <- DGEList(counts = counts)
+
+# Used the same regression design to set the expression filter
+keep_design <- filterByExpr(dge_design, design = main$design)
+dge_design <- dge_design[keep_design, , keep.lib.sizes = FALSE]
+
+# Recalculated library normalization for the new gene set
+dge_design <- normLibSizes(dge_design, method = "TMM")
+
+# Checked that samples were in the same order as our metadata
+stopifnot(
+  identical(colnames(dge_design$counts),
+            as.character(meta$participant_id)),
+  nrow(main$design) == ncol(dge_design$counts),
+  qr(main$design)$rank == ncol(main$design)
+)
+
+# Repeated voom and limma with the new gene set
+v_design <- voom(dge_design, main$design, plot = FALSE)
+
+fit_design <- lmFit(v_design, main$design)
+fit_design <- eBayes(fit_design, robust = TRUE)
+
+# Extracted the ASC association for all retained genes
+res_design <- topTable(
+  fit_design,
+  coef = "log_ASC7",
+  number = Inf,
+  adjust.method = "BH",
+  sort.by = "P"
+) %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  rename(beta_ASC = logFC)
+
+cat("Genes tested:", nrow(res_design), "\n")
+cat("Nominal p < 0.05:", sum(res_design$P.Value < 0.05), "\n")
+cat("BH FDR < 0.05:", sum(res_design$adj.P.Val < 0.05), "\n")
+cat("Minimum FDR:", min(res_design$adj.P.Val), "\n")
+
+print(head(res_design, 10))
+
+write_csv(
+  res_design,
+  file.path(out_dir, "10_design_filter_all_genes.csv")
+)
+```
+
+#10.2. Compared associations for genes tested by both methods
+
+```{r}
+shared <- main$results %>%
+  select(
+    gene_id,
+    beta_original = beta_ASC,
+    t_original = t,
+    p_original = P.Value,
+    FDR_original = adj.P.Val
+  ) %>%
+  inner_join(
+    res_design %>%
+      select(
+        gene_id,
+        beta_design = beta_ASC,
+        t_design = t,
+        p_design = P.Value,
+        FDR_design = adj.P.Val
+      ),
+    by = "gene_id"
+  )
+
+stopifnot(nrow(shared) == nrow(main$results))
+
+# Summarised agreement between the two filtering approaches
+filter_comparison <- tibble(
+  method = c("Single cohort", "Design-based"),
+  genes_tested = c(nrow(main$results), nrow(res_design)),
+  nominal_p05 = c(
+    sum(main$results$P.Value < 0.05),
+    sum(res_design$P.Value < 0.05)
+  ),
+  FDR05 = c(
+    sum(main$results$adj.P.Val < 0.05),
+    sum(res_design$adj.P.Val < 0.05)
+  ),
+  minimum_FDR = c(
+    min(main$results$adj.P.Val),
+    min(res_design$adj.P.Val)
+  )
+)
+
+print(filter_comparison)
+
+cat("\nShared genes:", nrow(shared), "\n")
+cat("Spearman correlation of t-statistics:",
+    cor(shared$t_original, shared$t_design,
+        method = "spearman"), "\n")
+cat("Same association direction:",
+    round(100 * mean(
+      sign(shared$t_original) == sign(shared$t_design)
+    ), 1), "%\n")
+
+write_csv(
+  filter_comparison,
+  file.path(out_dir, "10_filtering_model_comparison.csv")
+)
+
+write_csv(
+  shared,
+  file.path(out_dir, "10_shared_gene_comparison.csv")
+)
+```
+
+#10.3.Checked genes retained only by design-based filtering
+
+```{r}
+extra_genes <- setdiff(
+  res_design$gene_id,
+  main$results$gene_id
+)
+
+extra_results <- res_design %>%
+  filter(gene_id %in% extra_genes)
+
+# Compared average expression across shared and additional genes
+expression_check <- res_design %>%
+  mutate(
+    gene_group = if_else(
+      gene_id %in% extra_genes,
+      "Additional genes",
+      "Shared genes"
+    )
+  ) %>%
+  group_by(gene_group) %>%
+  summarise(
+    genes = n(),
+    median_logCPM = median(AveExpr),
+    nominal_p05 = sum(P.Value < 0.05),
+    FDR05 = sum(adj.P.Val < 0.05),
+    .groups = "drop"
+  )
+
+print(expression_check)
+
+# Checked the expression distributions
+p_expression <- res_design %>%
+  mutate(
+    gene_group = if_else(
+      gene_id %in% extra_genes,
+      "Additional genes",
+      "Shared genes"
+    )
+  ) %>%
+  ggplot(aes(gene_group, AveExpr)) +
+  geom_boxplot(
+    fill = "steelblue",
+    alpha = 0.6,
+    outlier.shape = NA
+  ) +
+  coord_cartesian(ylim = c(-2, 12)) +
+  labs(
+    title = "Expression of genes retained by each filter",
+    x = NULL,
+    y = "Average log2 expression (voom)"
+  ) +
+  theme_minimal()
+
+print(p_expression)
+
+ggsave(
+  file.path(out_dir, "10_additional_gene_expression.png"),
+  p_expression, width = 6, height = 5, dpi = 300
+)
+
+write_csv(
+  extra_results,
+  file.path(out_dir, "10_additional_gene_results.csv")
+)
+
+write_csv(
+  expression_check,
+  file.path(out_dir, "10_expression_check.csv")
+)
+```
+
+#10.4. Saved filtering sensitivity results for the report
+
+```{r}
+filter_summary <- tibble(
+  measure = c(
+    "Genes with original filtering",
+    "Genes with design-based filtering",
+    "Additional genes",
+    "Shared genes",
+    "FDR-significant genes: original",
+    "FDR-significant genes: design-based",
+    "Shared-gene t-statistic correlation",
+    "Shared genes with same direction (%)"
+  ),
+  value = c(
+    nrow(main$results),
+    nrow(res_design),
+    length(extra_genes),
+    nrow(shared),
+    sum(main$results$adj.P.Val < 0.05),
+    sum(res_design$adj.P.Val < 0.05),
+    cor(shared$t_original, shared$t_design, method = "spearman"),
+    100 * mean(sign(shared$t_original) ==
+                 sign(shared$t_design))
+  )
+)
+
+print(filter_summary)
+
+write_csv(
+  filter_summary,
+  file.path(out_dir, "10_filtering_summary_for_report.csv")
+)
+
+# Saved the alternative tested-gene universe for GO sensitivity
+write_lines(
+  rownames(dge_design$counts),
+  file.path(out_dir, "GO_background_design_filtered_Ensembl.txt")
+)
+```
+
+#11. Exploratory analysis - does day 0 ASC explain part of the day 7 associations? a# 11.1. Loaded and checked day 0 and day 7 ASC measurements
+
+```{r}
+
+# 11.1. Loaded and checked the original ASC measurements
+
+flow <- read_csv(
+  here::here("data", "publicData_ex_vivo_flow.csv"),
+  col_types = cols(
+    timepoint = col_character(),
+    .default = col_guess()
+  ),
+  show_col_types = FALSE
+)
+
+# Kept Day 0 and Day 7 ASC measurements from our cohort
+asc_flow <- flow %>%
+  filter(
+    study_accession == "2024_UGA",
+    name == "Antibody-secreting_cells_(ASC)",
+    timepoint %in% c("0", "7")
+  )
+
+# Checked sample counts, units and cell population
+flow_check <- asc_flow %>%
+  group_by(timepoint, unit, parent_population) %>%
+  summarise(n = n_distinct(participant_id), .groups = "drop")
+
+print(flow_check)
+
+# Confirmed that the records were unique and comparable
+stopifnot(
+  !anyDuplicated(asc_flow[c("participant_id", "timepoint")]),
+  n_distinct(asc_flow$unit) == 1,
+  n_distinct(asc_flow$parent_population) == 1,
+  all(is.finite(asc_flow$value))
+)
+
+# Extracted Day 0 ASC
+day0 <- asc_flow %>%
+  filter(timepoint == "0") %>%
+  select(participant_id, ASC_day0 = value)
+
+# Checked Day 7 against the values already used in limma
+day7 <- asc_flow %>%
+  filter(timepoint == "7") %>%
+  select(participant_id, ASC_day7_flow = value)
+
+check7 <- meta %>%
+  left_join(day7, by = "participant_id")
+
+stopifnot(
+  !anyNA(check7$ASC_day7_flow),
+  isTRUE(all.equal(
+    check7$ASC_day7,
+    check7$ASC_day7_flow,
+    tolerance = 1e-6
+  ))
+)
+
+cat("Day 7 ASC values matched our existing data.\n")
+
+```
+
+#11.2. Compared baseline and Day 7 ASC
+
+```{r}
+#Kept participants with both measurements
+paired <- meta %>%
+  inner_join(day0, by = "participant_id")
+
+stopifnot(
+  !anyDuplicated(paired$participant_id),
+  all(is.finite(paired$ASC_day0)),
+  all(paired$ASC_day0 >= 0)
+)
+
+cat("Paired participants:", nrow(paired), "\n")
+
+#Checked whether baseline ASC was related to Day 7 ASC
+asc_correlation <- cor.test(
+  paired$ASC_day0,
+  paired$ASC_day7,
+  method = "spearman",
+  exact = FALSE
+)
+
+print(asc_correlation)
+
+# Used logarithmic axes to make the skewed values easier to see
+p_day0 <- ggplot(paired, aes(ASC_day0, ASC_day7)) +
+  geom_point(size = 2.5, colour = "steelblue") +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title = "ASC frequency before and after vaccination",
+    subtitle = paste(nrow(paired), "participants with paired measurements"),
+    x = "Day 0 ASC (% of B cells)",
+    y = "Day 7 ASC (% of B cells)"
+  ) +
+  theme_minimal()
+
+print(p_day0)
+
+ggsave(
+  file.path(out_dir, "11_day0_day7_ASC.png"),
+  p_day0, width = 7, height = 5, dpi = 300
+)
+
+```
+
+#11.3. Checked whether baseline ASC adjustment changed the results
+
+```{r}
+# Standardised Day 0 ASC to avoid very small coefficients
+paired <- paired %>%
+  mutate(ASC0_sd = as.numeric(scale(ASC_day0)))
+
+stopifnot(
+  nrow(paired) >= 15,
+  all(is.finite(paired$ASC0_sd)),
+  !anyNA(paired$n_prior_imputed)
+)
+
+# Model without baseline ASC adjustment
+paired_basic <- fit_association(
+  paired,
+  ~ log_ASC7 + age_c + biological_sex + n_prior_imputed
+)
+
+# Same model, now accounting for baseline ASC
+paired_adjusted <- fit_association(
+  paired,
+  ~ log_ASC7 + ASC0_sd + age_c +
+    biological_sex + n_prior_imputed
+)
+
+# Matched gene results from both models
+paired_compare <- paired_basic$results %>%
+  select(
+    gene_id,
+    beta_without = beta_ASC,
+    t_without = t,
+    p_without = P.Value
+  ) %>%
+  inner_join(
+    paired_adjusted$results %>%
+      select(
+        gene_id,
+        beta_with = beta_ASC,
+        t_with = t,
+        p_with = P.Value
+      ),
+    by = "gene_id"
+  )
+
+# Summarised the change in associations
+paired_summary <- tibble(
+  participants = nrow(paired),
+  genes_tested = nrow(paired_compare),
+  t_correlation = cor(
+    paired_compare$t_without,
+    paired_compare$t_with,
+    method = "spearman"
+  ),
+  same_direction_pct = 100 * mean(
+    sign(paired_compare$beta_without) ==
+    sign(paired_compare$beta_with)
+  ),
+  FDR05_without = sum(
+    paired_basic$results$adj.P.Val < 0.05
+  ),
+  FDR05_with = sum(
+    paired_adjusted$results$adj.P.Val < 0.05
+  )
+)
+
+print(as.data.frame(paired_summary))
+
+write_csv(
+  paired_summary,
+  file.path(out_dir, "11_day0_adjustment_summary.csv")
+)
+
+write_csv(
+  paired_compare,
+  file.path(out_dir, "11_day0_gene_comparison.csv")
+)
+
+write_csv(
+  paired_adjusted$results,
+  file.path(out_dir, "11_day0_adjusted_results.csv")
+)
+```
+
+# 11.4. Plotted the change in gene-wise associations
+
+```{r}
+p_adjustment <- ggplot(
+  paired_compare,
+  aes(t_without, t_with)
+) +
+  geom_point(
+    size = 0.7,
+    alpha = 0.2,
+    colour = "steelblue"
+  ) +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Effect of adjusting for baseline ASC",
+    x = "Day 7 association: without Day 0 adjustment",
+    y = "Day 7 association: with Day 0 adjustment"
+  ) +
+  theme_minimal()
+
+print(p_adjustment)
+
+ggsave(
+  file.path(out_dir, "11_day0_adjustment_comparison.png"),
+  p_adjustment, width = 7, height = 6, dpi = 300
+)
+```
+
+#12. GO annotation and enrichment \# 12.1. Prepared gene lists for GO analysis
+
+```{r}
+go_dir <- file.path(out_dir, "12_GO")
+dir.create(go_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Used our initial log(ASC) model
+go_input <- main$results %>%
+  mutate(
+    gene_id = sub("\\.[0-9]+$", "", gene_id)
+  )
+
+stopifnot(
+  nrow(go_input) == 14473,
+  !anyDuplicated(go_input$gene_id),
+  all(is.finite(go_input$t))
+)
+
+# All genes eligible for testing
+background <- go_input$gene_id
+
+# Exploratory gene list for DAVID and PANTHER overrepresentation
+nominal_genes <- go_input %>%
+  filter(P.Value < 0.05)
+
+# Kept association directions separate for optional interpretation
+positive_genes <- nominal_genes %>%
+  filter(t > 0)
+
+negative_genes <- nominal_genes %>%
+  filter(t < 0)
+
+# Saved plain gene lists, one Ensembl ID per line
+write_lines(background,
+            file.path(go_dir, "GO_background.txt"))
+
+write_lines(nominal_genes$gene_id,
+            file.path(go_dir, "GO_nominal_p05.txt"))
+
+write_lines(positive_genes$gene_id,
+            file.path(go_dir, "GO_positive_p05.txt"))
+
+write_lines(negative_genes$gene_id,
+            file.path(go_dir, "GO_negative_p05.txt"))
+
+# PANTHER numerical enrichment: gene ID and signed statistic, no header
+write_tsv(
+  go_input %>% select(gene_id, t),
+  file.path(go_dir, "PANTHER_ranked_t.txt"),
+  col_names = FALSE
+)
+
+# Full statistics for documentation and subsequent annotation
+write_csv(
+  go_input %>% select(gene_id, beta_ASC, t, P.Value, adj.P.Val),
+  file.path(go_dir, "GO_all_gene_statistics.csv")
+)
+
+cat("Background genes:", length(background), "\n")
+cat("Nominal gene list:", nrow(nominal_genes), "\n")
+cat("Positive associations:", nrow(positive_genes), "\n")
+cat("Negative associations:", nrow(negative_genes), "\n")
+```
+
+```{r}
+#checked that the GO annotation packages were available
+stopifnot(
+  requireNamespace("AnnotationDbi", quietly = TRUE),
+  requireNamespace("org.Hs.eg.db", quietly = TRUE),
+  requireNamespace("GO.db", quietly = TRUE)
+)
+```
+
+#12.5.1. Built GO Biological Process gene sets
+
+```{r}
+# Removed any Ensembl version suffixes
+gene_ids <- sub("\\.[0-9]+$", "", rownames(main$voom$E))
+
+stopifnot(!anyDuplicated(gene_ids))
+
+# Retrieved all inherited GO Biological Process annotations
+go_map <- AnnotationDbi::select(
+  org.Hs.eg.db::org.Hs.eg.db,
+  keys = gene_ids,
+  columns = c("GOALL", "ONTOLOGYALL"),
+  keytype = "ENSEMBL"
+) %>%
+  filter(
+    ONTOLOGYALL == "BP",
+    !is.na(GOALL)
+  ) %>%
+  distinct(ENSEMBL, GOALL)
+
+# Converted gene IDs into row positions for CAMERA
+go_sets <- split(
+  match(go_map$ENSEMBL, gene_ids),
+  go_map$GOALL
+)
+
+go_sets <- lapply(go_sets, function(x) unique(na.omit(x)))
+
+# Kept informative pathway sizes
+go_sets <- go_sets[
+  lengths(go_sets) >= 15 &
+  lengths(go_sets) <= 500
+]
+
+stopifnot(length(go_sets) > 0)
+
+# Retrieved readable GO names
+go_names <- AnnotationDbi::select(
+  GO.db::GO.db,
+  keys = names(go_sets),
+  columns = "TERM",
+  keytype = "GOID"
+) %>%
+  distinct(GOID, .keep_all = TRUE)
+
+go_universe <- tibble(
+  GO_ID = names(go_sets),
+  genes_in_set = lengths(go_sets)
+) %>%
+  left_join(go_names, by = c("GO_ID" = "GOID"))
+
+cat("Genes with BP annotations:",
+    n_distinct(go_map$ENSEMBL), "\n")
+
+cat("GO terms tested:", length(go_sets), "\n")
+
+write_csv(
+  go_universe,
+  file.path(go_dir, "CAMERA_GO_terms_tested.csv")
+)
+
+```
+
+# 12.5.2. Tested GO sets under both ASC models
+
+```{r}
+stopifnot(
+  identical(rownames(main$voom$E),
+            rownames(raw_asc$voom$E))
+)
+
+# Used the same GO sets for both models
+camera_log <- limma::camera(
+  main$voom,
+  index = go_sets,
+  design = main$design,
+  contrast = which(colnames(main$design) == "log_ASC7"),
+  inter.gene.cor = 0.01
+)
+
+camera_raw <- limma::camera(
+  raw_asc$voom,
+  index = go_sets,
+  design = raw_asc$design,
+  contrast = which(colnames(raw_asc$design) == "ASC7_sd"),
+  inter.gene.cor = 0.01
+)
+
+# Added GO IDs and readable names
+format_camera <- function(results) {
+  results %>%
+    as.data.frame() %>%
+    rownames_to_column("GO_ID") %>%
+    left_join(go_universe, by = "GO_ID") %>%
+    arrange(PValue)
+}
+
+camera_log <- format_camera(camera_log)
+camera_raw <- format_camera(camera_raw)
+
+# Summarised the results
+camera_summary <- tibble(
+  model = c("Log ASC", "Original ASC"),
+  terms_tested = c(nrow(camera_log), nrow(camera_raw)),
+  FDR05 = c(
+    sum(camera_log$FDR < 0.05),
+    sum(camera_raw$FDR < 0.05)
+  ),
+  minimum_FDR = c(
+    min(camera_log$FDR),
+    min(camera_raw$FDR)
+  )
+)
+
+print(camera_summary)
+
+cat("\nStrongest GO terms under log ASC:\n")
+print(head(camera_log, 10))
+
+cat("\nStrongest GO terms under original ASC:\n")
+print(head(camera_raw, 10))
+
+write_csv(
+  camera_log,
+  file.path(go_dir, "CAMERA_log_ASC.csv")
+)
+
+write_csv(
+  camera_raw,
+  file.path(go_dir, "CAMERA_original_ASC.csv")
+)
+
+write_csv(
+  camera_summary,
+  file.path(go_dir, "CAMERA_summary.csv")
+)
+```
+
+# 12.5.3. Checked whether GO results agreed across ASC scales
+
+```{r}
+camera_compare <- camera_log %>%
+  select(
+    GO_ID, TERM, NGenes,
+    direction_log = Direction,
+    FDR_log = FDR,
+    p_log = PValue
+  ) %>%
+  inner_join(
+    camera_raw %>%
+      select(
+        GO_ID,
+        direction_raw = Direction,
+        FDR_raw = FDR,
+        p_raw = PValue
+      ),
+    by = "GO_ID"
+  ) %>%
+  mutate(
+    same_direction = direction_log == direction_raw
+  ) %>%
+  arrange(p_log)
+
+cat("Same GO direction:",
+    round(100 * mean(camera_compare$same_direction), 1),
+    "%\n")
+
+cat("FDR < 0.05 in both models:",
+    sum(camera_compare$FDR_log < 0.05 &
+        camera_compare$FDR_raw < 0.05), "\n")
+
+write_csv(
+  camera_compare,
+  file.path(go_dir, "CAMERA_model_comparison.csv")
+)
+```
+
+#12.5.4. Checked which genes drove the strongest GO terms
+
+```{r}
+top_go <- head(camera_log$GO_ID, 10)
+
+# Compared overlap between the leading gene sets
+overlap <- outer(
+  top_go, top_go,
+  Vectorize(function(a, b) {
+    length(intersect(go_sets[[a]], go_sets[[b]])) /
+      length(union(go_sets[[a]], go_sets[[b]]))
+  })
+)
+
+rownames(overlap) <- top_go
+colnames(overlap) <- top_go
+
+print(round(overlap, 2))
+
+# Identified the genes behind the strongest GO term
+top_genes <- gene_ids[go_sets[[top_go[1]]]]
+
+top_details <- main$results %>%
+  mutate(gene_id = sub("\\.[0-9]+$", "", gene_id)) %>%
+  filter(gene_id %in% top_genes) %>%
+  arrange(P.Value)
+
+print(top_details %>%
+        select(gene_id, beta_ASC, t, P.Value, adj.P.Val))
+
+write_csv(
+  top_details,
+  file.path(go_dir, "CAMERA_top_GO_genes.csv")
+)
+```
+
+# 12.5.5. Checked sensitivity to the inter-gene correlation assumption
+
+```{r}
+# Re-ran the primary model with correlation estimated for each gene set
+camera_estimated <- limma::camera(
+  main$voom,
+  index = go_sets,
+  design = main$design,
+  contrast = which(colnames(main$design) == "log_ASC7"),
+  inter.gene.cor = NA
+)
+
+camera_estimated <- format_camera(camera_estimated)
+
+# Compared exactly the same GO terms across both approaches
+cor_compare <- camera_log %>%
+  select(
+    GO_ID, TERM,
+    direction_fixed = Direction,
+    FDR_fixed = FDR
+  ) %>%
+  inner_join(
+    camera_estimated %>%
+      select(
+        GO_ID,
+        direction_estimated = Direction,
+        FDR_estimated = FDR,
+        Correlation
+      ),
+    by = "GO_ID"
+  )
+
+cor_summary <- tibble(
+  terms_compared = nrow(cor_compare),
+  FDR05_fixed = sum(cor_compare$FDR_fixed < 0.05),
+  FDR05_estimated = sum(cor_compare$FDR_estimated < 0.05),
+  significant_in_both = sum(
+    cor_compare$FDR_fixed < 0.05 &
+    cor_compare$FDR_estimated < 0.05
+  ),
+  same_direction_pct = 100 * mean(
+    cor_compare$direction_fixed ==
+    cor_compare$direction_estimated
+  ),
+  median_estimated_correlation = median(
+    cor_compare$Correlation, na.rm = TRUE
+  )
+)
+
+print(as.data.frame(cor_summary))
+
+# Examined the original significant GO terms
+print(
+  cor_compare %>%
+    filter(FDR_fixed < 0.05) %>%
+    arrange(FDR_fixed) %>%
+    select(GO_ID, TERM, FDR_fixed, FDR_estimated,
+           Correlation) %>%
+    head(15)
+)
+
+write_csv(
+  cor_compare,
+  file.path(go_dir, "CAMERA_correlation_sensitivity.csv")
+)
+```
+
+# 12.5.6. Checked sensitivity to GO set-size restrictions
+
+```{r}
+# Rebuilt GO sets using a broader size range
+go_sets_all <- split(
+  match(go_map$ENSEMBL, gene_ids),
+  go_map$GOALL
+)
+
+go_sets_all <- lapply(
+  go_sets_all,
+  function(x) unique(na.omit(x))
+)
+
+go_sets_broad <- go_sets_all[
+  lengths(go_sets_all) >= 10 &
+  lengths(go_sets_all) <= 1000
+]
+
+# Re-ran CAMERA with the same model and correlation setting
+camera_broad <- limma::camera(
+  main$voom,
+  index = go_sets_broad,
+  design = main$design,
+  contrast = which(colnames(main$design) == "log_ASC7"),
+  inter.gene.cor = 0.01
+)
+
+# Retained the GO identifiers and statistical results
+camera_broad <- camera_broad %>%
+  as.data.frame() %>%
+  rownames_to_column("GO_ID")
+
+# Compared original terms against their counterparts in the broader analysis
+size_compare <- camera_log %>%
+  select(
+    GO_ID, TERM, NGenes,
+    FDR_original = FDR,
+    p_original = PValue
+  ) %>%
+  inner_join(
+    camera_broad %>%
+      select(
+        GO_ID,
+        FDR_broad = FDR,
+        p_broad = PValue
+      ),
+    by = "GO_ID"
+  )
+
+size_summary <- tibble(
+  original_terms = length(go_sets),
+  broad_terms = length(go_sets_broad),
+  original_FDR05 = sum(camera_log$FDR < 0.05),
+  broad_FDR05 = sum(camera_broad$FDR < 0.05),
+  original_significant_retained = sum(
+    size_compare$FDR_original < 0.05 &
+    size_compare$FDR_broad < 0.05
+  )
+)
+
+print(as.data.frame(size_summary))
+
+# Checked the strongest original terms
+print(
+  size_compare %>%
+    arrange(p_original) %>%
+    head(15)
+)
+
+write_csv(
+  size_compare,
+  file.path(go_dir, "CAMERA_size_sensitivity.csv")
+)
+```
+
+# 12.6. Prepared ranked gene lists for GOrilla
+
+```{r}
+# Used the moderated t-statistics from our primary log(ASC) model
+gorilla_input <- main$results %>%
+  mutate(gene_id = sub("\\.[0-9]+$", "", gene_id)) %>%
+  select(gene_id, t)
+
+stopifnot(
+  nrow(gorilla_input) == 14473,
+  !anyDuplicated(gorilla_input$gene_id),
+  all(is.finite(gorilla_input$t))
+)
+
+# Ranked genes from strongest positive to strongest negative association
+gorilla_positive <- gorilla_input %>%
+  arrange(desc(t))
+
+# Reversed the ranking to examine negative associations
+gorilla_negative <- gorilla_input %>%
+  arrange(t)
+
+# Saved one Ensembl gene ID per line, without headers
+readr::write_lines(
+  gorilla_positive$gene_id,
+  file.path(go_dir, "GOrilla_positive_ranked.txt")
+)
+
+readr::write_lines(
+  gorilla_negative$gene_id,
+  file.path(go_dir, "GOrilla_negative_ranked.txt")
+)
+
+cat("Genes in each ranked list:", nrow(gorilla_input), "\n")
+cat("Positive list starts with:", head(gorilla_positive$gene_id, 3), "\n")
+cat("Negative list starts with:", head(gorilla_negative$gene_id, 3), "\n")
+```
+
+# 12.7. Imported the online GO enrichment results
+
+```{r}
+# Read the DAVID Functional Annotation Chart
+david <- readr::read_csv(
+  file.path(go_dir, "DAVID_chart.csv"),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    GO_ID = stringr::str_extract(`Full Term`, "GO:[0-9]+"),
+    TERM = Term,
+    DAVID_FDR = Benjamini,
+    DAVID_fold = `Fold Enrichment`
+  )
+
+# Imported PANTHER results and handled very small fold enrichment values
+
+panther <- readr::read_tsv(
+  file.path(go_dir, "PANTHER_results.txt"),
+  skip = 11,
+  show_col_types = FALSE
+) %>%
+  transmute(
+    GO_ID = stringr::str_extract(.data[[names(.)[1]]], "GO:[0-9]+"),
+    PANTHER_FDR = as.numeric(.data[[names(.)[8]]]),
+    PANTHER_fold = as.numeric(
+      ifelse(
+        grepl("<", .data[[names(.)[6]]]),
+        NA,
+        .data[[names(.)[6]]]
+      )
+    )
+  )
+
+# GOrilla exports are tab-separated files despite the .xls extension
+read_gorilla <- function(filename, label) {
+  readr::read_tsv(
+    file.path(go_dir, filename),
+    show_col_types = FALSE
+  ) %>%
+    transmute(
+      GO_ID = `GO Term`,
+      FDR = `FDR q-value`
+    ) %>%
+    rename(!!paste0("GOrilla_", label, "_FDR") := FDR)
+}
+
+gorilla_pos <- read_gorilla("GOrilla_positive.xls", "positive")
+gorilla_neg <- read_gorilla("GOrilla_negative.xls", "negative")
+
+# Used the CAMERA results already calculated before
+camera_final <- camera_log %>%
+  select(
+    GO_ID,
+    CAMERA_fixed_FDR = FDR
+  ) %>%
+  left_join(
+    camera_estimated %>%
+      select(GO_ID, CAMERA_estimated_FDR = FDR),
+    by = "GO_ID"
+  )
+
+# Checked that GO IDs were unique within each result table
+stopifnot(
+  !anyDuplicated(david$GO_ID),
+  !anyDuplicated(panther$GO_ID),
+  !anyDuplicated(gorilla_pos$GO_ID),
+  !anyDuplicated(gorilla_neg$GO_ID),
+  !anyDuplicated(camera_final$GO_ID)
+)
+
+cat("DAVID terms:", nrow(david), "\n")
+cat("PANTHER terms:", nrow(panther), "\n")
+cat("GOrilla positive terms:", nrow(gorilla_pos), "\n")
+cat("GOrilla negative terms:", nrow(gorilla_neg), "\n")
+cat("CAMERA terms:", nrow(camera_final), "\n")
+```
+
+# 12.8. Matched biological processes across enrichment methods
+
+```{r}
+
+# Retrieved readable names for GO identifiers across the tools
+all_go_ids <- unique(na.omit(c(
+  david$GO_ID,
+  panther$GO_ID,
+  gorilla_pos$GO_ID,
+  gorilla_neg$GO_ID,
+  camera_final$GO_ID
+)))
+
+go_labels <- AnnotationDbi::select(
+  GO.db::GO.db,
+  keys = all_go_ids,
+  columns = "TERM",
+  keytype = "GOID"
+) %>%
+  distinct(GOID, .keep_all = TRUE) %>%
+  rename(GO_ID = GOID, TERM_annotation = TERM)
+
+# Combined results, excluding records without a GO identifier
+go_final <- david %>%
+  full_join(
+    panther %>% filter(!is.na(GO_ID)),
+    by = "GO_ID"
+  ) %>%
+  full_join(gorilla_pos, by = "GO_ID") %>%
+  full_join(gorilla_neg, by = "GO_ID") %>%
+  full_join(camera_final, by = "GO_ID") %>%
+  left_join(go_labels, by = "GO_ID") %>%
+  mutate(
+    TERM = coalesce(TERM, TERM_annotation),
+    DAVID_sig = !is.na(DAVID_FDR) & DAVID_FDR < 0.05,
+    PANTHER_sig = !is.na(PANTHER_FDR) & PANTHER_FDR < 0.05,
+    GOrilla_positive_sig = !is.na(GOrilla_positive_FDR) &
+      GOrilla_positive_FDR < 0.05,
+    GOrilla_negative_sig = !is.na(GOrilla_negative_FDR) &
+      GOrilla_negative_FDR < 0.05,
+    CAMERA_fixed_sig = !is.na(CAMERA_fixed_FDR) &
+      CAMERA_fixed_FDR < 0.05,
+    CAMERA_estimated_sig = !is.na(CAMERA_estimated_FDR) &
+      CAMERA_estimated_FDR < 0.05
+  ) %>%
+  select(-TERM_annotation)
+
+cat("GO terms without readable names:",
+    sum(is.na(go_final$TERM)), "\n")
+
+# Summarised the significant GO terms
+go_final_summary <- tibble(
+  Method = c(
+    "DAVID",
+    "PANTHER",
+    "GOrilla positive",
+    "GOrilla negative",
+    "CAMERA fixed correlation",
+    "CAMERA estimated correlation"
+  ),
+  Significant_terms = c(
+    sum(go_final$DAVID_sig),
+    sum(go_final$PANTHER_sig),
+    sum(go_final$GOrilla_positive_sig),
+    sum(go_final$GOrilla_negative_sig),
+    sum(go_final$CAMERA_fixed_sig),
+    sum(go_final$CAMERA_estimated_sig)
+  )
+)
+
+print(go_final_summary)
+
+# Checked DAVID/PANTHER agreement
+cat(
+  "GO terms significant in both DAVID and PANTHER:",
+  sum(go_final$DAVID_sig & go_final$PANTHER_sig),
+  "\n"
+)
+
+# Checked which DAVID/PANTHER terms also appeared in negative GOrilla
+cat(
+  "DAVID/PANTHER significant terms also significant in negative GOrilla:",
+  sum(
+    go_final$DAVID_sig &
+    go_final$PANTHER_sig &
+    go_final$GOrilla_negative_sig
+  ),
+  "\n"
+)
+
+write_csv(
+  go_final,
+  file.path(go_dir, "GO_final_all_methods.csv")
+)
+
+write_csv(
+  go_final_summary,
+  file.path(go_dir, "GO_final_summary.csv")
+)
+```
+
+# 12.9. Examined GO terms supported by both DAVID and PANTHER
+
+```{r}
+shared_go <- go_final %>%
+  filter(DAVID_sig, PANTHER_sig) %>%
+  arrange(DAVID_FDR) %>%
+  select(
+    GO_ID, TERM,
+    DAVID_FDR, PANTHER_FDR,
+    GOrilla_positive_FDR,
+    GOrilla_negative_FDR,
+    CAMERA_fixed_FDR,
+    CAMERA_estimated_FDR
+  )
+
+print(as.data.frame(shared_go))
+
+write_csv(
+  shared_go,
+  file.path(go_dir, "GO_shared_DAVID_PANTHER.csv")
+)
+```
+
+# 12.10. Compared DAVID and PANTHER enrichment visually
+
+```{r}
+# Selected GO terms significant in both DAVID and PANTHER
+plot_terms <- go_final %>%
+  filter(DAVID_sig, PANTHER_sig) %>%
+  arrange(DAVID_FDR) %>%
+  pull(GO_ID)
+
+plot_data <- go_final %>%
+  filter(GO_ID %in% plot_terms) %>%
+  select(GO_ID, TERM, DAVID_FDR, PANTHER_FDR) %>%
+  tidyr::pivot_longer(
+    cols = c(DAVID_FDR, PANTHER_FDR),
+    names_to = "Method",
+    values_to = "FDR"
+  ) %>%
+  filter(!is.na(FDR)) %>%
+  mutate(
+    Method = recode(
+      Method,
+      DAVID_FDR = "DAVID",
+      PANTHER_FDR = "PANTHER"
+    ),
+    score = -log10(pmax(FDR, .Machine$double.xmin)),
+    TERM = factor(
+      TERM,
+      levels = rev(
+        go_final$TERM[match(plot_terms, go_final$GO_ID)]
+      )
+    )
+  )
+
+p_go_final <- ggplot(
+  plot_data,
+  aes(x = score, y = TERM, colour = Method)
+) +
+  geom_point(size = 2.8) +
+  geom_vline(
+    xintercept = -log10(0.05),
+    linetype = "dashed",
+    colour = "grey50"
+  ) +
+  labs(
+    title = "GO Biological Process enrichment",
+    subtitle = "GO terms significant in both DAVID and PANTHER",
+    x = expression(-log[10]("FDR-adjusted p-value")),
+    y = NULL,
+    colour = "Method",
+    caption = "Dashed line: FDR = 0.05. Exploratory nominal-p gene list."
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank()
+  )
+
+print(p_go_final)
+
+ggsave(
+  file.path(go_dir, "GO_DAVID_PANTHER_comparison.png"),
+  p_go_final,
+  width = 10,
+  height = 7,
+  dpi = 300
+)
+```
+
+```{r}
+nrow(go_final)
+sum(is.na(go_final$GO_ID))
+sum(is.na(go_final$TERM))
+sum(go_final$DAVID_sig & go_final$PANTHER_sig)
+```
+
+# 12.11. Saved GO analysis settings and R package versions
+
+```{r}
+go_settings <- c(
+  "Primary model: log(ASC Day 7), adjusted for age, sex and vaccination history",
+  "Genes tested: 14473",
+  "DAVID/PANTHER foreground: nominal gene-level p < 0.05 (2096 genes)",
+  "DAVID/PANTHER background: all 14473 tested genes",
+  "Ontology: GO Biological Process",
+  "DAVID: EASE enrichment, Benjamini correction",
+  "PANTHER: Fisher exact test, FDR correction",
+  "GOrilla: separate positive and negative signed-t rankings",
+  "CAMERA: fixed correlation 0.01 and estimated-correlation sensitivity",
+  "CAMERA primary GO set size: 15-500 tested genes",
+  "CAMERA size sensitivity: 10-1000 tested genes",
+  "GO significance threshold: FDR < 0.05"
+)
+
+writeLines(
+  go_settings,
+  file.path(go_dir, "GO_analysis_settings.txt")
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(go_dir, "GO_R_session_info.txt")
+)
+
+cat("Final GO comparison files saved to:", go_dir, "\n")
+```
