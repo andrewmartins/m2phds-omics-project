@@ -16,7 +16,7 @@ library(here)
 library(sva)
 ```
 
-This step removes all unexpressed gene.
+This step removes all unexpressed genes.
 
 ```{r}
 analysis_tpm <- readRDS(here("data", "processed", "analysis_tpm.rds"))
@@ -85,9 +85,11 @@ pca_plot
 
 ```
 
-Will be using PC1 and PC2 for the inital visaulization
+Will be using PC1 and PC2 for the inital visualization (elbow method). 
 
 ## Exploring PCA by available demographics characteristics
+
+Variables that can be continuous and categorical are observed in both types. 
 
 ```{r}
 ## SEX
@@ -107,9 +109,11 @@ ggsave(here("output", "pca_sex_plot.png"), pca_sex_plot, width = 8, height = 6)
 pca_sex_plot
 ```
 
+The two people with extreme outcome will be removed for further visualizations, allowing to zoom in on to the cluster. 
+
 ```{r}
 ## AGE GROUP
-# Categorizing based on the median, Q1 and Q3 (No research)
+# Categorizing based on the median, Q1 and Q3 (No research done)
 
 filtered_analysis_tpm <- filtered_analysis_tpm %>%
   mutate(Age_group = case_when(
@@ -225,7 +229,7 @@ pca_vax_plot_b <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = n_prior_vax )
 ggsave(here("output", "pca_vax_plot_b.png"), pca_vax_plot_b, width = 8, height = 6)
 pca_vax_plot_b
 ```
-
+Vaccination history is creating a slight separation in the visualization: might be associated with the outcome.  
 
 ```{r}
 pca_scores$pf_d7 <- filtered_analysis_tpm$pf_d7
@@ -252,7 +256,7 @@ pca_plasm_plot
 
 Most participants clustered relatively close together on all variables. 
 - Participants with higher plasmablast frequencies did not form an obvious separate cluster. There was no obvious gradient in plasmablast frequency across PC1 and PC2.
-- participants with higher number of previosu vaccination did form a gradient across PC1 and PC2. 
+- participants with higher number of previous vaccination did form a gradient across PC1 and PC2. 
 
 ------------------------------------------------------------------------
 
