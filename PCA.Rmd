@@ -78,7 +78,17 @@ pca_plot <- ggplot(pc_plot_data, aes(x = PC, y = Variance)) +
     x = "Principal Component",
     y = "Percentage of Variance Explained"
   ) +
-  theme_minimal()
+  theme_minimal()+
+  theme(
+    plot.title = element_text(size = 16),
+    axis.title = element_text(size = 16),
+    axis.title.x = element_text(
+      margin = ggplot2::margin(t = 12)
+    ),
+    axis.text = element_text(size = 13),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
 
 ggsave(here("output", "pca_plot.png"), pca_plot, width = 8, height = 6)
 pca_plot
@@ -201,6 +211,15 @@ pca_vax_cat_plot
 ```{r}
 ## number of prior vaccination (as continuous)
 
+# Overwriting median imputation on the people with missing vaccines information
+filtered_analysis_tpm <- filtered_analysis_tpm %>%
+  mutate(
+    n_prior_vax = case_when(
+      subject %in% c("ID_443", "ID_683") ~ 0,
+      TRUE ~ n_prior_vax
+    )
+  )
+
 # Create a separate variable for PCA
 filtered_analysis_tpm <- filtered_analysis_tpm %>%
   mutate(n_prior_vax_pca = na_if(n_prior_vax, 0))
@@ -224,6 +243,16 @@ pca_vax_plot_b <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = n_prior_vax )
     title = "PCA by Previous Vaccination",
     x = "PC1",
     y = "PC2"
+  )+
+  theme(
+    plot.title = element_text(size = 16),
+    axis.title = element_text(size = 16),
+    axis.title.x = element_text(
+      margin = ggplot2::margin(t = 12)
+    ),
+    axis.text = element_text(size = 13),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
   )
 
 ggsave(here("output", "pca_vax_plot_b.png"), pca_vax_plot_b, width = 8, height = 6)
@@ -247,6 +276,13 @@ pca_plasm_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = pf_d7)) +
     title = "PCA of baseline gene expression",
     x = "PC1",
     y = "PC2"
+  )+
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
   )
 
 ggsave(here("output", "pca_plasm_plot.png"), pca_plasm_plot, width = 8, height = 6)
